@@ -1542,8 +1542,7 @@ class OpStackLoader(Operator):
     
     def notifyConnectAll(self):
         globString = self.inputs["globstring"].value
-        self.fileNameList = (glob.glob(globString))
-        self.fileNameList.sort()
+        self.fileNameList = sorted(glob.glob(globString))
 
         if len(self.fileNameList) != 0:
             self.info = vigra.impex.ImageInfo(self.fileNameList[0])

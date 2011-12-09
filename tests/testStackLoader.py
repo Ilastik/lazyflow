@@ -32,22 +32,24 @@ class testOpStackLoader(TestCase):
         loader = OpStackLoader(g)
         loader.inputs["globstring"].setValue(self.testdir+"/*."+filetype)
         result = loader.outputs["stack"][:].allocate().wait()
-        
-        if  not (result == self.block).all():
-            raise RuntimeError('test failed')
+       
+	self.assertTrue(result == self.block).all() 
 
     
     def stackAndTestKey(self):
-        
-        g = Graph()
+        """
+	generates the number of keys specified when initiating the test class
+	and checks the output of the operator. For this to work createImages()
+	has to be called first. clean() is recommended afterwards.
+	"""
+	g = Graph()
         loader = OpStackLoader(g)
         loader.inputs["globstring"].setValue(self.testdir+"*.png")
         
         for i in range(self.keys):
             key = self.makeKey()
             result = loader.outputs["stack"][key].allocate().wait()
-            if  not (result == self.block[key]).all():
-                raise RuntimeError('test failed')
+	    self.assertTrue(result == self.block[key]).all()  
     
     def makeKey(self):
         
