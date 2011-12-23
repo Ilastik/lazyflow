@@ -1616,5 +1616,66 @@ class OpStackLoader(Operator):
             i = i+1        
                 
            
+class OpGrayscaleInverter(Operator):
+    name = "Grayscale Inversion Operator"
+    category = "" #Pls set some standed categories
+
+    inputSlots = [InputSlot("input", stype = "array")]
+    outputSlots = [OutputSlot("output")]
+
+    def notifyConnectAll(self):
+
+        inputSlot = self.inputs["input"]
+
+        if inputSlot:
+            oslot = self.outputs["output"]
+
+            oslot._shape = inputSlot.shape
+            oslot._dtype = inputSlot.dtype
+            oslot._axistags = copy.copy(inputSlot.axistags)
+
+        else:
+            oslot = self.outputs["output"]
+
+            oslot._shape = None
+            oslot._dtype = None
+            oslot._axistags = None
+
+    def getOutSlot(self, slot, key, result):
         
+        #this assumes that the last dimension is the channel. 
+        image = self.inputs["input"][:].allocate().wait()
+        for i in range(image.shape[-1]):
+            result[:,:,i] = 255-image[:,:,i]
+        return result
+
+class OpToUint8(Operator):
+    name = "UInt8 Conversion Operator"
+    category = "" #Pls set some standed categories
+    
+    inputSlots = [InputSlot("input", stype = "array")]
+    outputSlots = [OutputSlot("output")]
+    
+    
+    def notifyConnectAll(self):
+
+        inputSlot = self.inputs["input"]
+
+        if inputSlot:
+            oslot = self.outputs["output"]
+
+            oslot._shape = inputSlot.shape
+            oslot._dtype = numpy.uint8
+            oslot._axistags = copy.copy(inputSlot.axistags)
+
+        else:
+            oslot = self.outputs["output"]
+
+            oslot._shape = None
+            oslot._dtype = None
+            oslot._axistags = None
+
+        def getOutSlot(self, slot, key, result):
         
+            image = self.inputs["input"][:].allocate().wait()
+            result[:] = image.numpy.astype('uint8')
