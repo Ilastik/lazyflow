@@ -25,7 +25,7 @@ except:
     sys.stdout.write(os.linesep+os.linesep)
 
     ops = list(itersubclasses(Operator))
-    
+    '''
     dirs = lazyflow.graph.CONFIG.get("Operators","directories", lazyflow.graph.CONFIG_DIR + "operators")
     dirs = dirs.split(",")
     for d in dirs:
@@ -49,4 +49,5 @@ except:
         for o in newOps:
             print "    Adding", o.__name__
             globals()[o.__name__] = o
+	'''
     sys.stdout.write(os.linesep)

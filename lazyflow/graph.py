@@ -33,6 +33,9 @@ import vigra
 import sys
 import copy
 import psutil
+import atexit
+import traceback
+
 
 if int(psutil.__version__.split(".")[0]) < 1 and int(psutil.__version__.split(".")[1]) < 3:
     print "Lazyflow: Please install a psutil python module version of at least >= 0.3.0"
@@ -55,8 +58,11 @@ import greenlet
 import weakref
 import threading
 
+
 greenlet.GREENLET_USE_GC = False #use garbage collection
 sys.setrecursionlimit(100000)
+
+
 
 class DefaultConfigParser(ConfigParser.SafeConfigParser):
     """
@@ -114,7 +120,7 @@ class Operators(object):
     @classmethod
     def register(cls, opcls):
         cls.operators[opcls.__name__] = opcls
-        print "registered operator %s (%s)", (opcls.name, opcls.__name__)
+        print "registered operator %s (%s)" % (opcls.name, opcls.__name__)
 
     @classmethod
     def registerOperatorSubclasses(cls):
@@ -194,6 +200,7 @@ class GetItemWriterObject(object):
   
     def allocate(self, axistags = False, priority = 0):
         """
+print "\n\n"
         if the user does not want lazyflow to write calculation
         results into a specific numpy array he can use
         the .allocate() call.
@@ -212,17 +219,18 @@ class GetItemWriterObject(object):
 
       
 class CustomGreenlet(greenlet.greenlet):
-    
-    def __init__(self, func):
-        self.lastRequest = None
-        self.currentRequest = None
-        greenlet.greenlet.__init__(self, func)
-        self.thread = None
+    __slots__ = ("lastRequest","currentRequest","thread")
 
-setattr(current_thread(), "finishedRequestGreenlets", PriorityQueue())
-setattr(current_thread(), "workAvailableEvent", Event())
-setattr(current_thread(), "process", psutil.Process(os.getpid()))
 
+def patchForeignCurrentThread():
+  setattr(current_thread(), "finishedRequestGreenlets", deque())#PriorityQueue())
+  setattr(current_thread(), "workAvailableEvent", Event())
+  setattr(current_thread(), "process", psutil.Process(os.getpid()))
+  setattr(current_thread(), "lastRequest", None)
+  setattr(current_thread(), "greenlet", None)
+
+#patch main thread
+patchForeignCurrentThread()
 
 class GetItemRequestObject(object):
     """ 
@@ -261,7 +269,7 @@ class GetItemRequestObject(object):
         self.notifyQueue = deque()
         self.cancelQueue = deque()
         self._requestLevel = -1
-        
+        self.lock = Lock()
         if isinstance(slot, InputSlot) and self.slot._value is None:
             self.func = slot.partner.operator.getOutSlot
             self.arg1 = slot.partner            
@@ -270,51 +278,66 @@ class GetItemRequestObject(object):
             self.arg1 = slot
         else:
             # we are in the ._value case of an inputSlot
-            if self.destination is None:
-                self.destination = self.slot._allocateStorage(self._writer._start, self._writer._stop, False)            
             gr = greenlet.getcurrent()
-            if hasattr(gr, "currentRequest"):
+            if isinstance(gr,CustomGreenlet):
                 self.parentRequest = gr.currentRequest    
                 assert gr.currentRequest is not None
             self.wait() #this sets self._finished and copies the results over
         if not self._finished:
-            self.lock = Lock()
-            #self._putOnTaskQueue()
-            #return
-            
             gr = greenlet.getcurrent()
-            if hasattr(gr, "currentRequest"):
+            if isinstance(gr,CustomGreenlet):
                 # we delay the firing of an request until
                 # another one arrives 
                 # by this we make sure that one call path
                 # through the graph is done in one greenlet/thread
                 
-                lr = gr.lastRequest
+                self._burstLastRequest(gr)
                 self.parentRequest = gr.currentRequest
                 gr.currentRequest.lock.acquire()
                 gr.currentRequest.childRequests[self] = self
                 self._requestLevel = gr.currentRequest._requestLevel + self._priority + 1
                 gr.lastRequest = self
-                gr.currentRequest.lock.release()                
-                if lr is not None:
-                    lr._putOnTaskQueue()
+                gr.currentRequest.lock.release()
 
             else:
-                # we are in main thread
+                # we are in a unknownnnon worker thread
+                tr = current_thread()
+                if not hasattr(tr,"lastRequest"):
+                  #some bad person called our library from a completely unknown strange thread
+                  patchForeignCurrentThread()
+                lr = tr.lastRequest
+                tr.lastRequest = self
+                if lr is not None:
+                  lr.lock.acquire()
+                  if lr.inProcess is False:
+                    lr.inProcess = True
+                    lr.lock.release()
+                    lr._putOnTaskQueue()
+                  else:
+                    lr.lock.release()
                 self._requestLevel = self._priority
             
 
     def _execute(self, gr):
+        self.inProcess = True
         temp = gr.currentRequest
         if self.destination is None:
             self.destination = self.slot._allocateStorage(self._writer._start, self._writer._stop, False)
         gr.currentRequest = self
-        self.func(self.arg1,self.key, self.destination)
+        try:
+          self.func(self.arg1,self.key, self.destination)
+        except Exception,e:
+          if isinstance(self.slot, InputSlot):
+            print
+            print "ERROR: Exception in Operator %s (%r)" % (self.slot.partner.operator.name, self.slot.partner.operator)
+          else:
+            pass 
+          traceback.print_exc(e)
+          sys.exit(1)
         self._finalize()        
         gr.currentRequest = temp
 
     def _putOnTaskQueue(self):
-        self.inProcess = True
         self.graph.putTask(self)
     
     def getResult(self):
@@ -340,90 +363,110 @@ class GetItemRequestObject(object):
         if isinstance(self.slot, OutputSlot) or self.slot._value is None:
             self.lock.acquire()
             gr = greenlet.getcurrent()
-            if self.canceled:
-                self.canceled = False
-                self._finished = False
-                self.childRequests = {}
-                self.parentRequest = gr.currentRequest
             if not self._finished:
                 if self.inProcess:   
-                    if hasattr(gr, "currentRequest"):                         
-                        if not self._finished:
-                            self.waitQueue.append((gr.thread, gr.currentRequest, gr))
-                            self.lock.release()
+                    if isinstance(gr,CustomGreenlet):
+                        self.waitQueue.append((gr.thread, gr.currentRequest, gr))
+                        gr.currentRequest.childRequests[self] = self
+                        self.lock.release()
 
-                            # reprioritize this request if running requests
-                            # requestlevel is higher then that of the request
-                            # on which we are waiting -> prevent starving of
-                            # high prio requests through resources blocked
-                            # by low prio requests.
-                            if gr.currentRequest._requestLevel > self._requestLevel:
-                                delta = gr.currentRequest._requestLevel - self._requestLevel
-                                self.adjustPriority(delta)
-                            
-                            self._burstLastRequest(gr)
-                            if gr.lastRequest == self:
-                                gr.lastRequest = None                                  
-                            gr.thread.greenlet.switch(None)
-                        else:
-                            self.lock.release()
-                            return self.destination
+                        # reprioritize this request if running requests
+                        # requestlevel is higher then that of the request
+                        # on which we are waiting -> prevent starving of
+                        # high prio requests through resources blocked
+                        # by low prio requests.
+                        if gr.currentRequest._requestLevel > self._requestLevel:
+                            delta = gr.currentRequest._requestLevel - self._requestLevel
+                            self.adjustPriority(delta)
+                        
+                        self._burstLastRequest(gr)
+                        gr.thread.greenlet.switch(None)
                     else:
-                        tr = current_thread()                    
+                        tr = current_thread()
+                        if not hasattr(tr,"lastRequest"):
+                          #some bad person called our library from a completely unknown strange thread
+                          patchForeignCurrentThread()
+                        lr = tr.lastRequest
+                        tr.lastRequest = None
+                        if lr is not None and lr != self:
+                          lr.lock.acquire()
+                          if lr.inProcess is False:
+                            lr.inProcess = True
+                            lr.lock.release()
+                            lr._putOnTaskQueue()
+                          else:
+                            lr.lock.release()
                         cgr = CustomGreenlet(self.wait)
+                        cgr.lastRequest = None
                         cgr.currentRequest = self
                         cgr.thread = tr                        
                         self.lock.release()
+                        tr.greenlet = gr
                         cgr.switch(self)
                         self._waitFor(cgr,tr) #wait for finish
                 else:
-                    if hasattr(gr, "currentRequest"):
+                    if isinstance(gr,CustomGreenlet):
                         self._burstLastRequest(gr)
-                        if gr.lastRequest == self:
-                            gr.lastRequest = None
                         self.inProcess = True
-                        temp = gr.currentRequest
                         self.lock.release()
                         self._execute(gr)
-                        gr.currentRequest = temp
                     else:
-                        tr = current_thread()                    
-                        cgr = CustomGreenlet(self.wait)
+                        tr = current_thread()
+                        if not hasattr(tr,"lastRequest"):
+                          #some bad person called our library from a completely unknown strange thread
+                          patchForeignCurrentThread()
+
+                        lr = tr.lastRequest
+                        tr.lastRequest = None
+                        if lr is not None and lr != self:
+                          lr.lock.acquire()
+                          if lr.inProcess is False:
+                            lr.inProcess = True
+                            lr.lock.release()
+                            lr._putOnTaskQueue()
+                          else:
+                            lr.lock.release()
+                        cgr = CustomGreenlet(self._execute)
                         cgr.currentRequest = self
-                        cgr.thread = tr                        
+                        cgr.thread = tr
+                        cgr.lastRequest = None
+                        self.inProcess = True
                         self.lock.release()
-                        setattr(tr,"greenlet", greenlet.getcurrent())
-                        cgr.switch(self)
+                        tr.greenlet = gr
+                        
+                        cgr.switch(cgr)
                         self._waitFor(cgr,tr) #wait for finish
             else:
                 self.lock.release()
+            try:
+              gr.currentRequest.childRequests.pop(self)
+            except:
+              pass
         else:
             if self.destination is None:
                 self.destination = self.slot._allocateStorage(self._writer._start, self._writer._stop, False)
-            
-            if isinstance(self.slot._value, (numpy.ndarray, vigra.VigraArray)):
+            try:
                 self.destination[:] = self.slot._value[self.key]
-            else:
+            except (AttributeError, TypeError): # not an array
                 self.destination[:] = self.slot._value
-            self._finished = True
-        return self.destination   
+        self._finished = True
+        if self.canceled is False:
+          assert self.destination is not None
+          return self.destination
+        else:
+          return None
   
-      
-    def processReqObject(self,reqObject):
-        reqObject.func(reqObject.arg1, reqObject.key, reqObject.destination)
-        reqObject._finalize()
       
     def _waitFor(self, cgr, tr):
         while not cgr.dead:
             tr.workAvailableEvent.wait()
             tr.workAvailableEvent.clear()
-            while not tr.finishedRequestGreenlets.empty():
-                prio,req, gr = tr.finishedRequestGreenlets.get(block = False)
+            while len(tr.finishedRequestGreenlets) > 0:
+                prio,req, gr = tr.finishedRequestGreenlets.pop()#get(block = False)
                 gr.currentRequest = req                 
                 gr.switch()
                 del gr
         del cgr
-        self._finalize()
 
 
     def _burstLastRequest(self,gr):
@@ -432,6 +475,7 @@ class GetItemRequestObject(object):
         if lr is not None and lr != self:            
             lr.lock.acquire()
             if lr.inProcess is False and lr.canceled is False:
+                lr.inProcess = True
                 lr.lock.release()
                 lr._putOnTaskQueue()
             else:
@@ -452,9 +496,11 @@ class GetItemRequestObject(object):
         else:
             self.notifyQueue.append((closure, kwargs))
             if not self.inProcess:
+                self.inProcess = True
+                self.lock.release()
                 self._putOnTaskQueue()
-            self.lock.release()
-
+            else:
+              self.lock.release()
             
     def onCancel(self, closure, **kwargs):
         self.lock.acquire()       
@@ -470,86 +516,90 @@ class GetItemRequestObject(object):
         self._finished = True
         self.cancelQueue = deque()
         self.childRequests = {}
+        nq = self.notifyQueue
+        wq = self.waitQueue
+
+        self.notifyQueue = deque()
+        self.waitQueue = deque()
+
         self.lock.release()
         p = self.parentRequest
+        self.parentRequest = None
+        gr = greenlet.getcurrent()
         if p is not None:
             l = p._requestLevel + 1
             p._requestLevel = l
             
         if self.graph.suspended is False or self.parentRequest is not None:
             if self.canceled is False:
-                while len(self.notifyQueue) > 0:
+                while len(nq) > 0:
                     try:
-                        func, kwargs = self.notifyQueue.pop()
+                        func, kwargs = nq.pop()
                     except:
                         break
                     func(self.destination, **kwargs)
     
-            waiters = []
-            while len(self.waitQueue) > 0:
-                try:
-                    w = self.waitQueue.pop()
-                    waiters.append(w)
-                except:
-                    break
-            waiter = sorted(waiters, key=lambda x: -x[1]._requestLevel)
-            for tr, req, gr in waiters:
+            while len(wq) > 0:
+                w = wq.pop()
+                tr, req, gr = w
                 req.lock.acquire()
                 if not req.canceled:
-                    tr.finishedRequestGreenlets.put((-req._requestLevel, req, gr))
+                    tr.finishedRequestGreenlets.append((-req._requestLevel,req,gr))#put((-req._requestLevel, req, gr))
+                    req.lock.release()
                     tr.workAvailableEvent.set()
-                req.lock.release()
+                else:
+                  req.lock.release()
         else:
             self.graph.putFinalize(self)
-        #self.parentRequest = None
         
 
         
     def _cancel(self):
         self.lock.acquire()
-        if not self._finished:
-            self.canceled = True
-            self.lock.release()
-            while len(self.cancelQueue) > 0:
-                try:
-                    closure, kwargs = self.cancelQueue.pop()
-                except:
-                    break
-                closure(**kwargs)
-        else:
-            self.lock.release()
-            pass
-        self._finalize()
-#            while len(self.waitQueue) > 0:
-#                tr, req, gr = self.waitQueue.popleft()
-#                if req.canceled is False:
-#                    tr.finishedRequestGreenlets.append((req, gr))
-#                    tr.workAvailableEvent.set()
+        canceled = True
+        if len(self.waitQueue) == 0:
+          if not self._finished:
+              while canceled and len(self.cancelQueue) > 0:
+                  try:
+                      closure, kwargs = self.cancelQueue.pop()
+                  except:
+                      break
+                  
+                  canceled = canceld and not (closure(**kwargs) == False)
 
-    def _cancelChildren(self):
+          self.lock.release()
+          if canceled:
+            self.canceled = True
+            self._finalize()
+          return canceled
+        else:
+          self.lock.release()
+          return False
+
+    def _cancelChildren(self,level):
             self.lock.acquire()
             childs = tuple(self.childRequests.values())
             self.childRequests = {}
             self.lock.release()
             for r in childs:
-                r.cancel()            
+                r.cancel(level = level + 1)            
 
     def _cancelParents(self):
         if not self._finished:
-            self._cancel()
-            if self.parentRequest is not None:
+            if self._cancel():
+              if self.parentRequest is not None:
                 self.parentRequest._cancelParents()
 
 
-    def cancel(self):
-        self.lock.acquire()
+    def cancel(self, level = 0):
         if not self._finished:
-            self.canceled = True
-            self.lock.release()
-            self._cancelChildren()
-            #self._cancelParents()
-        else:            
-            self.lock.release()
+            if self._cancel():
+              self._cancelChildren(level = level)
+              return True
+            else:
+              print "NOT CANCELING CHILDREN level=%d" % level, self
+              return False
+
         
     def __call__(self):
         assert 1==2, "Please use the .wait() method, () is deprecated !"
@@ -576,7 +626,7 @@ class InputSlot(object):
         self.shape = None
         self.dtype = None
 
-    def setValue(self, value):
+    def setValue(self, value, notify = True):
         """
         This methods allows to directly provide an array
         or other entitiy as input the the InputSlot instead
@@ -584,18 +634,19 @@ class InputSlot(object):
         """
         assert self.partner == None, "InputSlot %s (%r): Cannot dot setValue, because it is connected !" %(self.name, self)
         self._value = value
-        if isinstance(value, (numpy.ndarray, vigra.VigraArray)):
+
+        try:
             self.shape = value.shape
             self.dtype = value.dtype
             if hasattr(value, "axistags"):
                 self.axistags = value.axistags
             else:
                 self.axistags = vigra.defaultAxistags(len(value.shape))
-        else:
+        except (AttributeError, TypeError): # not an array like value
             self.shape = (1,)
             self.dtype = object
             self.axistags = vigra.defaultAxistags(1)
-        self._checkNotifyConnect()
+        self._checkNotifyConnect(notify = notify)
 
     @property
     def value(self):
@@ -618,7 +669,7 @@ class InputSlot(object):
         return answer
 
 
-    def connect(self, partner):
+    def connect(self, partner, notify = True):
         """
         connects the InputSlot to a partner OutputSlot
         
@@ -630,7 +681,7 @@ class InputSlot(object):
             self.disconnect()
             return    
             
-        if not isinstance(partner,(OutputSlot,MultiOutputSlot)):
+        if not isinstance(partner,(OutputSlot,MultiOutputSlot,Operator)):
             self.setValue(partner)
             return
             
@@ -658,14 +709,15 @@ class InputSlot(object):
             # do a type check
             self.connectOk(self.partner)
             if self.shape is not None:
-                self._checkNotifyConnect()
+                self._checkNotifyConnect(notify = notify)
     
-    def _checkNotifyConnect(self):
+    def _checkNotifyConnect(self, notify = True):
         if self.operator is not None:
-            self.operator._notifyConnect(self)
+            if notify:
+              self.operator._notifyConnect(self)
             self._checkNotifyConnectAll()
             
-    def _checkNotifyConnectAll(self):
+    def _checkNotifyConnectAll(self, notify = True):
         """
         notify operator of connection
         the operator may do a compatibility
@@ -730,6 +782,8 @@ class InputSlot(object):
         
         allows to call inputslot[0,:,3:11] 
         """
+        if type(key) == tuple:
+          assert len(key) == len(self.shape)
         start, stop = sliceToRoi(key, self.shape)
         assert len(stop) == len(self.shape)
         assert stop <= list(self.shape)
@@ -737,7 +791,7 @@ class InputSlot(object):
         assert self.partner is not None or self._value is not None, "cannot do __getitem__ on Slot %s, of %r Not Connected!" % (self.name, self.operator)
         return GetItemWriterObject(self, key)
 
-    def _allocateStorage(self, start, stop, axistags = True):
+    def _allocateStorage(self, start, stop, axistags = False):
         storage = numpy.ndarray(stop - start, dtype=self.dtype)
         if axistags is True:
            storage = vigra.VigraArray(storage, storage.dtype, axistags = copy.copy(self.axistags))
@@ -762,7 +816,7 @@ class InputSlot(object):
             "operator" : self.operator,
             "partner" : self.partner,
             "value" : self._value,
-            "stype" : self._stype,
+            "_stype" : self._stype,
             "dtype" : self.dtype,
             "axistags" : self.axistags,
             "shape" : self.shape
@@ -782,7 +836,7 @@ class InputSlot(object):
             "operator" : "operator",
             "partner" : "partner",
             "value" : "_value",
-            "stype" : "stype",
+            "_stype" : "_stype",
             "dtype" : "dtype",
             "axistags" : "axistags",
             "shape" : "shape"
@@ -875,12 +929,12 @@ class OutputSlot(object):
     def _dtype(self, value):
         self.dtype = value
                 
-    def _connect(self, partner):
+    def _connect(self, partner, notify = True):
         if partner not in self.partners:
             self.partners.append(partner)
         #Re-run the connect anyway, because we might want to
         #propagate information like this
-        partner.connect(self)
+        partner.connect(self, notify = notify)
         
     def disconnect(self):
         for p in self.partners:
@@ -964,7 +1018,7 @@ class OutputSlot(object):
             "axistags" : self.axistags,
             "dtype" : self.dtype,
             "partners" : self.partners,
-            "stype" : self._stype
+            "_stype" : self._stype
             
         },patchBoard)
     
@@ -983,7 +1037,7 @@ class OutputSlot(object):
             "axistags" : "axistags",
             "dtype" : "dtype",
             "partners" : "partners",
-            "stype" : "stype"
+            "_stype" : "_stype"
             
         },patchBoard)
             
@@ -1027,56 +1081,70 @@ class MultiInputSlot(object):
     def __len__(self):
         return len(self.inputSlots)
         
-    def resize(self, size):
+    def resize(self, size, notify = True, event = None):
         oldsize = len(self)
         
         while size > len(self):
-            self._appendNew()
+            self._appendNew(notify=False,connect=False)
             
         while size < len(self):
-            self._removeInputSlot(self[-1])
+            self._removeInputSlot(self[-1], notify = False)
 
-        if oldsize < size:
-            for index in range(oldsize-1,size):
-                islot = self.inputSlots[index]
-        
+        if notify:
+          self._notifySubSlotResize(tuple(),tuple(),size = size,event = event)
+
+        for i in range(oldsize,size):
+          self._connectSubSlot(i, notify = notify)
+
+    def _connectSubSlot(self,slot, notify = True):
+      if type(slot) == int:
+        index = slot
+        slot = self.inputSlots[slot]
+      else:
+        index = self.inputSlots.index(slot)
+
+      if self.partner is not None:
+          if self.partner.level > 0:
+              if len(self.partner) >= len(self):
+                  self.partner[index]._connect(slot, notify = notify)
+          else:
+              self.partner._connect(slot, notify = notify)
+      if self._value is not None:
+          slot.setValue(self._value, notify = notify)    
+
+
                     
-    def _appendNew(self):
+    def _appendNew(self, notify = True, event = None, connect = True):
         if self.level <= 1:
             islot = InputSlot(self.name ,self, stype = self._stype)
         else:
             islot = MultiInputSlot(self.name,self, stype = self._stype, level = self.level - 1)
-        index = len(self) - 1
         self.inputSlots.append(islot)
-    
-        if self.partner is not None:
-            if self.partner.level > 0:
-                if len(self.partner) >= len(self):
-                    self.partner[index]._connect(islot)
-            else:
-                self.partner._connect(islot)
-        if self._value is not None:
-            islot.setValue(self._value)    
+        islot.name = self.name
+        index = len(self)-1
+        if notify:
+          self._notifySubSlotInsert((islot,),tuple(), event = event)
+        if connect:
+          self._connectSubSlot(index)
+        return islot
 
-        return islot 
 
-    def _insertNew(self, index):
+    def _insertNew(self, index, notify = True, connect = True):
         if self.level == 1:
             islot = InputSlot(self.name,self, self._stype)
         else:
             islot = MultiInputSlot(self.name,self, stype = self._stype, level = self.level - 1)
         self.inputSlots.insert(index,islot)
-        for i, isl in enumerate(self.inputSlots[index+1:]):
-            isl.name = self.name
-        if self.partner is not None:
-            if len(self.partner) > index:
-                islot.connect(self.partner[index])
-        elif self._value is not None:
-            islot.setValue(self._value)                
+        islot.name = self.name
+        if notify:
+          self._notifySubSlotInsert((islot,),tuple())
+        if connect:
+          self._connectSubSlot(index)
+
         return islot
     
     
-    def _checkNotifyConnectAll(self):
+    def _checkNotifyConnectAll(self, notify = True):
         
         # check wether all slots are connected and eventuall notify operator            
         if issubclass(self.operator.__class__, Operator):
@@ -1091,18 +1159,6 @@ class MultiInputSlot(object):
             self.operator._checkNotifyConnectAll()
         
     
-    def cloneConnectionsFrom(self, otherInputSlot):
-        self.resize(len(otherInputSlot))
-        for i, slot in enumerate(otherInputSlot):
-            if slot.level == 0:
-                if slot.partner is not None:
-                    self[i].connect(slot.partner)
-                elif slot._value is not None:
-                    self[i].setValue(slot._value)
-                    
-            else:
-                self[i].cloneConnectionsFrom(slot)
-
     def connected(self):
         answer = True
         if self._value is None and self.partner is None:
@@ -1128,12 +1184,12 @@ class MultiInputSlot(object):
             return 0
 
         
-    def connect(self,partner):
+    def connect(self,partner, notify = True):
         if partner is None:
             self.disconnect()
             return
         
-        if not isinstance(partner,(OutputSlot,MultiOutputSlot)):
+        if not isinstance(partner,(OutputSlot,MultiOutputSlot,Operator)):
             self.setValue(partner)
             return
           
@@ -1157,8 +1213,9 @@ class MultiInputSlot(object):
                 for i,p in enumerate(self.partner):
                     self.partner[i]._connect(self[i])
                 
-                self.operator._notifyConnect(self)
-                self._checkNotifyConnectAll()
+                if notify:
+                  self.operator._notifyConnect(self)
+                self._checkNotifyConnectAll(notify = notify)
                 
             elif partner.level < self.level:
                 #if self.partner is not None:
@@ -1168,7 +1225,7 @@ class MultiInputSlot(object):
                     slot.connect(partner)
                     if self.operator is not None:
                         self.operator._notifySubConnect((self,slot), (i,))
-                self._checkNotifyConnectAll()
+                self._checkNotifyConnectAll(notify=notify)
             elif partner.level > self.level:
                 #if self.partner is not None:
                 #    self.partner.disconnectSlot(self)
@@ -1193,6 +1250,10 @@ class MultiInputSlot(object):
         index = self.inputSlots.index(slots[0])
         self.operator._notifySubConnect( (self,) + slots, (index,) +indexes)
 
+    def _notifySubSlotInsert(self,slots,indexes,event = None):
+        index = self.inputSlots.index(slots[0])
+        self.operator._notifySubSlotInsert( (self,) + slots, (index,) + indexes, event = event)
+
     def _notifyDisconnect(self, slot):
         index = self.inputSlots.index(slot)
         self.operator._notifySubDisconnect((self, slot), (index,))
@@ -1201,13 +1262,19 @@ class MultiInputSlot(object):
         index = self.inputSlots.index(slots[0])
         self.operator._notifySubDisconnect((self,) + slots, (index,) + indexes)
         
-    def _notifySubSlotRemove(self, slots, indexes):
+    def _notifySubSlotRemove(self, slots, indexes, event = None):
         if len(slots)>0:
             index = self.inputSlots.index(slots[0])
             indexes = (index,) + indexes
-        self.operator._notifySubSlotRemove((self,) + slots, indexes)
+        self.operator._notifySubSlotRemove((self,) + slots, indexes, event = event)
             
-        
+    def _notifySubSlotResize(self,slots,indexes,size,event = None):
+        if len(slots) > 0:
+          index = self.inputSlots.index(slots[0])
+          indexes = (index,) + indexes
+        self.operator._notifySubSlotResize((self,) + slots, indexes, size, event = event)
+
+
     def disconnect(self):
         for slot in self.inputSlots:
             slot.disconnect()
@@ -1217,13 +1284,13 @@ class MultiInputSlot(object):
             self.inputSlots = []
             self.partner = None
     
-    def removeSlot(self, index, notify = True):
+    def removeSlot(self, index, notify = True, event = None):
         slot = index
         if type(index) is int:
             slot = self[index]
-        self._removeInputSlot(slot, notify)
+        self._removeInputSlot(slot, notify, event = event)
     
-    def _removeInputSlot(self, inputSlot, notify = True):
+    def _removeInputSlot(self, inputSlot, notify = True, event = None):
         try:
             index = self.inputSlots.index(inputSlot)
         except:
@@ -1238,17 +1305,11 @@ class MultiInputSlot(object):
         # index is the number of the slots while it
         # was still there
         if notify:
-            self._notifySubSlotRemove((),(index,))
+            self._notifySubSlotRemove((),(index,),event = event)
         self.inputSlots.remove(inputSlot)
-        for i, slot in enumerate(self[index:]):
-            slot.name = self.name+"3%d" % (index + i)
 
         
 
-    def _partialSetItem(self, slot, key, value):
-        index = self.inputSlots.index(slot)
-        self.operator.multiSlotSetItem(self,slot,index, key,value)   
-    
     #TODO RENAME? createInstance
     # def __copy__ ?
     def getInstance(self, operator):
@@ -1285,7 +1346,7 @@ class MultiInputSlot(object):
             "level" : self.level,
             "operator" : self.operator,
             "partner" : self.partner,
-            "stype" : self._stype,
+            "_stype" : self._stype,
             "inputSlots": self.inputSlots
             
         },patchBoard)
@@ -1302,7 +1363,7 @@ class MultiInputSlot(object):
             "level" : "level",
             "operator" : "operator",
             "partner" : "partner",
-            "stype" : "stype",
+            "_stype" : "_stype",
             "inputSlots": "inputSlots"
             
         },patchBoard)
@@ -1346,40 +1407,45 @@ class MultiOutputSlot(object):
     def __len__(self):
         return len(self.outputSlots)
     
-    def append(self, outputSlot):
+    def append(self, outputSlot, event = None):
         outputSlot.operator = self
         self.outputSlots.append(outputSlot)
         index = len(self.outputSlots) - 1
         for p in self.partners:
-            p.resize(len(self))
+            p.resize(len(self), event = event)
             outputSlot._connect(p.inputSlots[index])
     
-    def insert(self, index, outputSlot):
+    def _insertNew(self,index, event = None):
+        oslot = OutputSlot(self.name,self,stype=self._stype)
+        self.insert(index,oslot, event = event)
+
+
+    def insert(self, index, outputSlot, event = None):
         outputSlot.operator = self
-        self.outputSlots.append(outputSlot)
+        self.outputSlots.insert(index,outputSlot)
         for p in self.partners:
-            pslot = p._insertNew(index)
+            pslot = p._insertNew(index, event = event)
             outputSlot._connect(pslot)
         
-    def remove(self, outputSlot):
+    def remove(self, outputSlot, event = None):
         index = self.outputSlots.index(outputSlot)
-        self.pop(index)
+        self.pop(index, event = event)
     
-    def pop(self, index = -1):
+    def pop(self, index = -1, event = None):
         oslot = self.outputSlots[index]
         for p in oslot.partners:
             if isinstance(p.operator, MultiInputSlot):
-                p.operator._removeInputSlot(p)
+                p.operator._removeInputSlot(p, event = event)
         
         oslot.disconnect()
         oslot = self.outputSlots.pop(index)
         
-    def _connect(self, partner):
+    def _connect(self, partner, notify = True):
         if partner not in self.partners:
             self.partners.append(partner)
         #Re-run the connect anyway, because we might want to
         #propagate information like this
-        partner.connect(self)
+        partner.connect(self, notify = notify)
         
     def disconnect(self):
         slots = self[:]
@@ -1395,7 +1461,7 @@ class MultiOutputSlot(object):
         for s in slots:
             self.remove(s)
             
-    def resize(self, size):
+    def resize(self, size, event = None):
         while len(self) < size:
             if self.level == 1:
                 slot = OutputSlot(self.name,self, stype = self._stype)
@@ -1409,7 +1475,7 @@ class MultiOutputSlot(object):
             self.pop()
 
         for p in self.partners:
-            p.resize(size)
+            p.resize(size, event = event)
             assert len(p) == len(self)
                 
             
@@ -1456,7 +1522,7 @@ class MultiOutputSlot(object):
             "level" : self.level,
             "operator" : self.operator,
             "partners" : self.partners,
-            "stype" : self._stype,
+            "_stype" : self._stype,
             "outputSlots" : self.outputSlots
             
         },patchBoard)
@@ -1473,7 +1539,7 @@ class MultiOutputSlot(object):
             "level" : "level",
             "operator" : "operator",
             "partners" : "partners",
-            "stype" : "stype",
+            "_stype" : "_stype",
             "outputSlots" : "outputSlots"
             
         },patchBoard)
@@ -1481,11 +1547,53 @@ class MultiOutputSlot(object):
         return s
 
 
+class InputDict(dict):
+    
+    def __init__(self, operator):
+      self.operator = operator
+
+
+    def __setitem__(self, key, value):
+        assert isinstance(value, (InputSlot, MultiInputSlot)), "ERROR: all elements of .inputs must be of type InputSlot or MultiInputSlot, you provided %r !" % (value,)
+        return dict.__setitem__(self, key, value)
+    def __getitem__(self, key):
+        if self.has_key(key):
+          return dict.__getitem__(self,key)
+        else:
+          raise Exception("Operator %s (class: %s) has no input slot named '%s'. available input slots are: %r" %(self.operator.name, self.operator.__class__, key, self.keys()))
+
+    @classmethod
+    def reconstructFromH5G(cls, h5g, patchBoard):
+        temp = InputDict()
+        patchBoard[h5g.attrs["id"]] = temp
+        for i,g in h5g.items():
+            temp[str(i)] = g.reconstructObject(patchBoard)
+        return temp
+
+
+
 class OutputDict(dict):
     
+    def __init__(self, operator):
+      self.operator = operator
+
+
     def __setitem__(self, key, value):
         assert isinstance(value, (OutputSlot, MultiOutputSlot)), "ERROR: all elements of .outputs must be of type OutputSlot or MultiOutputSlot, you provided %r !" % (value,)
         return dict.__setitem__(self, key, value)
+    def __getitem__(self, key):
+        if self.has_key(key):
+          return dict.__getitem__(self,key)
+        else:
+          raise Exception("Operator %s (class: %s) has no output slot named '%s'. available output slots are: %r" %(self.operator.name, self.operator.__class__, key, self.keys()))
+
+    @classmethod
+    def reconstructFromH5G(cls, h5g, patchBoard):
+        temp = OutputDict()
+        patchBoard[h5g.attrs["id"]] = temp
+        for i,g in h5g.items():
+            temp[str(i)] = g.reconstructObject(patchBoard)
+        return temp
 
 class Operator(object):
     """
@@ -1523,8 +1631,8 @@ class Operator(object):
     
     def __init__(self, graph, register = True):
         self.operator = None
-        self.inputs = {}
-        self.outputs = OutputDict()
+        self.inputs = InputDict(self)
+        self.outputs = OutputDict(self)
         self.graph = graph
         self.register = register
         #provide simple default name for lazy users
@@ -1547,6 +1655,9 @@ class Operator(object):
             # of the partner operators are created  
         if self.register:
             self.graph.registerOperator(self)
+
+        if len(self.inputs.keys()) == 0:
+          self.notifyConnectAll()
          
     def _getOriginalOperator(self):
         return self
@@ -1607,16 +1718,23 @@ class Operator(object):
     def _notifySubConnect(self, slots, indexes):
         self.notifySubConnect(slots,indexes)
 
-    def _notifySubSlotRemove(self, slots, indexes):
+    def _notifySubSlotRemove(self, slots, indexes, event = None):
         self.notifySubSlotRemove(slots, indexes)
         
-  
-  
+    def _notifySubSlotInsert(self,slots,indexes, event = None):
+        self.notifySubSlotInsert(slots,indexes)
+
+    def _notifySubSlotResize(self,slots,indexes, size,event = None):
+        self.notifySubSlotResize(slots,indexes,size,event)
+
     def connect(self, **kwargs):
         for k in kwargs:
-          self.inputs[k].connect(kwargs[k])
-
-
+          if k in self.inputs.keys():
+            self.inputs[k].connect(kwargs[k])
+          else:
+            print "ERROR, connect(): operator %s has no slot named %s" % (self.name, k)
+            print "                  available inputSlots are: ", self.inputs.keys()
+            assert(1==2)
 
     """
     This method is called opon connection of an inputslot.
@@ -1680,7 +1798,12 @@ class Operator(object):
     def notifySubSlotRemove(self, slots, indexes):
         pass
          
-         
+    def notifySubSlotInsert(self,slots,indexes):
+      pass
+
+    def notifySubSlotResize(self,slots,indexes,size,event):
+      pass
+
     """
     This method of the operator is called when a connected operator
     or an outside user of the graph wants to retrieve the calculation results
@@ -1789,6 +1912,8 @@ class Operator(object):
         
         return op
         
+
+
 class OperatorWrapper(Operator):
     name = ""
     
@@ -1801,10 +1926,12 @@ class OperatorWrapper(Operator):
         return self._outputSlots
     
     def __init__(self, operator, register = False):
-        self.inputs = {}
-        self.outputs = OutputDict()
+        self.inputs = InputDict(self)
+        self.outputs = OutputDict(self)
         self.operator = operator
         self.register = False
+        self._eventCounter = 0
+        self._processedEvents = {}
         if operator is not None:
             self.graph = operator.graph
             self.name = operator.name
@@ -1850,7 +1977,6 @@ class OperatorWrapper(Operator):
                 while isinstance(op.operator, (Operator, MultiOutputSlot)):
                     op = op.operator
                 op.outputs[oslot.name] = oo
-    
             #connect input slots
             for islot in self.origInputs.values():
                 ii = self.inputs[islot.name]
@@ -1887,6 +2013,7 @@ class OperatorWrapper(Operator):
             if islot.partner is not None:
                 if islot.partner.level > self.origInputs[iname].level:
                     needWrapping = True
+                    return
                 
         if needWrapping is False:
             if lazyflow.verboseWrapping:
@@ -1931,52 +2058,46 @@ class OperatorWrapper(Operator):
         return opcopy
     
     def _removeInnerOperator(self, op):
+        op.disconnect()
         index = self.innerOperators.index(op)
         self.innerOperators.remove(op)
         for name, oslot in self.outputs.items():
             oslot.pop(index)
-        op.disconnect()
 
     def _connectInnerOutputsForIndex(self, index):
-        for k,mslot in self.outputs.items():
-            #assert isinstance(mslot,MultiOutputSlot)
-            mslot.resize(len(self.innerOperators))
-
         innerOp = self.innerOperators[index]
         for key,mslot in self.outputs.items():            
             mslot[index] = innerOp.outputs[key]
 
             
     def _connectInnerOutputs(self):
-        for k,mslot in self.outputs.items():
-            #assert isinstance(mslot,MultiOutputSlot)
-            mslot.resize(len(self.innerOperators))
+        #for k,mslot in self.outputs.items():
+        #    #assert isinstance(mslot,MultiOutputSlot)
+        #    mslot.resize(len(self.innerOperators))
 
         for key,mslot in self.outputs.items():
             for index, innerOp in enumerate(self.innerOperators):
-                mslot[index] = innerOp.outputs[key]
+                if innerOp is not None and index < len(mslot):
+                  mslot[index] = innerOp.outputs[key]
 
-#    def _recuresSetOutputs(self, outer, inner):
-#        if not isinstance(inner, MultiOutputSlot):
-#            assert not isinstance(outer, MultiOutputSlot)
-#            outer._dtype = inner._dtype
-#            outer._shape = inner._shape
-#            outer._axistags = inner._axistags
-#        else:
-#            outer.resize(len(inner))
-#            for i, innerSlot in enumerate(inner):
-#                self._recuresSetOutputs(outer[i], inner[i])
-                
-
-
-    def _ensureInputSize(self, numMax = 0):
+    def _ensureInputSize(self, numMax = 0, event = None):
         
+        if event is None:
+          self._eventCounter += 1
+          event = (id(self),self._eventCounter)
+
+        if self._processedEvents.has_key(event):
+          return
+
+        self._processedEvents[event] = True
         newInnerOps = []
         maxLen = numMax
         for name, islot in self.inputs.items():
             assert isinstance(islot, MultiInputSlot)
             maxLen = max(islot._requiredLength(), maxLen)
-                
+        
+
+
         while maxLen > len(self.innerOperators):
             newop = self._createInnerOperator()
             self.innerOperators.append(newop)
@@ -1986,16 +2107,19 @@ class OperatorWrapper(Operator):
             op = self.innerOperators[-1]
             self._removeInnerOperator(op)
 
-        for k,mslot in self.inputs.items():
-            mslot.resize(maxLen)
-            assert len(mslot) == maxLen
-#            for i, slot in enumerate(mslot):
-#                if slot.partner is not None:
-#                    slot.partner._connect(self.innerOperators[i].inputs[mslot.name])
+        for name, islot in self.inputs.items():
+            islot.resize(maxLen, notify = False, event = event)
+
+        for name, oslot in self.outputs.items():
+            oslot.resize(maxLen,event = event)
+
+        #for name, oslot in self.outputs.items():
+        #    oslot.resize(maxLen)
+
         return maxLen
 
     def _notifyConnect(self, inputSlot):
-        
+
         maxLen = self._ensureInputSize(len(inputSlot))
         for i,islot in enumerate(inputSlot):
             if islot.partner is not None:
@@ -2013,62 +2137,103 @@ class OperatorWrapper(Operator):
 
     
     def _notifyConnectAll(self):
-        maxLen = self._ensureInputSize()
-        for o in self.outputs.values():
-            o.resize(maxLen)
-            
-        while len(self.innerOperators) > maxLen:
-            self.innerOperators.pop()
-            
-    def _notifySubConnect(self, slots, indexes):
-        numMax = self._ensureInputSize(len(slots[0]))
+        pass
+    
+    def _notifySubSlotInsert(self,slots,indexes, event = None):
+        #print "_notifySubSlotInsert Wrapper of", self.operator.name,slots, indexes
+        if len(indexes) != 1:
+          return
         
+        if event is None:
+          self._eventCounter += 1
+          event = (id(self),self._eventCounter)
+
+        if self._processedEvents.has_key(event):
+          return
+
+        self._processedEvents[event] = True
+                                                            
+        op = self._createInnerOperator()
+        self.innerOperators.insert(indexes[0],op)
+
+        for k,oslot in self.outputs.items():
+          oslot._insertNew(indexes[0], event = event)
+
+
+        for k,islot in self.inputs.items():
+          if islot != slots[0]:
+            islot._insertNew(indexes[0],notify=False, event = event)
+
+    def _notifySubSlotResize(self,slots,indexes,size,event = None):
+        if len(indexes) != 0:
+          return
+
+        if event is None:
+          self._eventCounter += 1
+          event = (id(self),self._eventCounter)
+
+        #print "_notifySubSlotResize Wrapper of", self.operator.name,slots, indexes,size
+
+        if self._processedEvents.has_key(event):
+          return
+
+        self._processedEvents[event] = True
+
+        oldSize = len(self.innerOperators)
+
+        while len(self.innerOperators) < size:
+          op = self._createInnerOperator()
+          self.innerOperators.append(op)
+
+        while len(self.innerOperators) > size:
+          op = self.innerOperators.pop()
+  
+
+        for k,oslot in self.outputs.items():
+          oslot.resize(size,event = event)
+
+        for k,islot in self.inputs.items():
+          if islot != slots[0]:
+            islot.resize(size,event = event)
+
+
+
+
+
+    def _notifySubSlotRemove(self, slots, indexes, event = None):
+        
+        #print "_notifySubSlotRemove Wrapper of ", self.operator.name,slots, indexes
+        if len(indexes) != 1:
+          return
+        
+        if event is None:
+          self._eventCounter += 1
+          event = (id(self),self._eventCounter)
+
+        if self._processedEvents.has_key(event):
+          return
+
+        self._processedEvents[event] = True
+
+        op = self.innerOperators[indexes[0]]
+
+
+        for k,oslot in self.outputs.items():
+          oslot.pop(indexes[0], event = event)
+
+        self.innerOperators.pop(indexes[0])
+
+        for k,islot in self.inputs.items():
+          if islot != slots[0]:
+            islot.removeSlot(indexes[0],notify=False, event = event)
+
+
+    def _notifySubConnect(self, slots, indexes):
+        #print "_notifySubConnect Wrapper of", self.operator.name, slots, indexes
         if slots[1].partner is not None:
-            #
-            # we have to connect the sub operator only
-            # if it is a true inner operator, but not
-            # if it is an OperatorWrapper. 
-            #
-            # why, is unclear.
-            #
-            #if not isinstance(self.innerOperators[indexes[0]], OperatorWrapper):
             self.innerOperators[indexes[0]].inputs[slots[0].name].connect(slots[1].partner)
         elif slots[1]._value is not None:
-            #if not isinstance(self.innerOperators[indexes[0]], OperatorWrapper):
-            self.innerOperators[indexes[0]].inputs[slots[0].name].disconnect()
             self.innerOperators[indexes[0]].inputs[slots[0].name].setValue(slots[1]._value)
-            
-        else:            
-            if isinstance(self.innerOperators[indexes[0]], OperatorWrapper):
-                
-                if len(indexes)>1:
-                    self.innerOperators[indexes[0]]._notifySubConnect(slots[1:],indexes[1:])
-                else:
-                    self.innerOperators[indexes[0]]._notifyConnect(slots[1],indexes[0])
-
-#                # check wether all slots are connected and notify operator            
-#                op = self.innerOperators[indexes[0]]
-#                allConnected = True
-#                for slot in op.inputs.values():
-#                    if slot.partner is None and slot._value is None:
-#                        allConnected = False
-#                        break
-#                if allConnected:
-#                    op.notifyConnectAll()
-                    
-            else:
-                if len(indexes)>1:
-                    self.innerOperators[indexes[0]].inputs[slots[0].name].resize(len(slots[1]))
-                    for i, islot in enumerate(slots[1]):
-                        if islot.partner is not None:
-                            self.innerOperators[indexes[0]].inputs[slots[0].name][i].connect(islot.partner)
-                        elif islot._value is not None:
-                            self.innerOperators[indexes[0]].inputs[slots[0].name][i].setValue(islot._value)
-                else:
-                    if slots[1].partner is not None:
-                        self.innerOperators[indexes[0]].inputs[slots[0].name].connect(slots[1].partner)
-                    elif slots[1]._value is not None:
-                        self.innerOperators[indexes[0]].inputs[slots[0].name].setValue(slots[1]._value)                        
         self._connectInnerOutputsForIndex(indexes[0])
         return
 
@@ -2078,26 +2243,7 @@ class OperatorWrapper(Operator):
         
     def _notifySubDisconnect(self, slots, indexes):
         return
-        maxLen = 0
-        for name, islot in self.inputs.items():
-            maxLen = max(len(islot), maxLen)
-        
-        while len(self.innerOperators) > maxLen:
-            op = self.innerOperators[-1]
-            self._removeInnerOperator(op)
 
-    def notifySubSlotRemove(self, slots, indexes):
-        if len(indexes) == 1:
-            if len(self.innerOperators) > indexes[0]:
-                op = self.innerOperators[indexes[0]]
-                self._removeInnerOperator(op)
-        else:
-            if slots[0].partner is not None: #normal connect case
-                self.innerOperators[indexes[0]]._notifySubSlotRemove(slots[1:], indexes[1:])
-            else: #connectAdd case
-                op = self.innerOperators[indexes[0]]
-                self._removeInnerOperator(op)
-        self._connectInnerOutputs()
                 
     def getOutSlot(self, slot, key, result):
         #this should never be called !!!        
@@ -2299,9 +2445,8 @@ class Worker(Thread):
         Thread.__init__(self)
         self.graph = graph
         self.working = False
-        self._hasSlept = False
         self.daemon = True # kill automatically on application exit!
-        self.finishedRequestGreenlets = PriorityQueue()
+        self.finishedRequestGreenlets = deque()#PriorityQueue()
         self.currentRequest = None
         self.requests = deque()
         self.process = psutil.Process(os.getpid())
@@ -2321,29 +2466,27 @@ class Worker(Thread):
         prioLastReq = 0
         while self.graph.running:
             if not self.workAvailableEvent.isSet():
-                self.graph.freeWorkers.append(self)
+                self.graph.freeWorkers.add(self)
             self.workAvailableEvent.wait()#(0.2)
             try:
                 self.graph.freeWorkers.remove(self)
             except:
                 pass
             self.workAvailableEvent.clear()
-            self._hasSlept = True
             
-            while not self.graph.tasks.empty() or not self.finishedRequestGreenlets.empty() or (not self.graph.newTasks.empty() and self._hasSlept):       
-                #print self, len(self.openUserRequests)                
-                while not self.finishedRequestGreenlets.empty():
-                    prioFinReq, req, gr = self.finishedRequestGreenlets.get(block = False)
+            didSomething = True
+
+            while didSomething:
+                didSomething = False
+                while len(self.finishedRequestGreenlets) > 0:
+                    prioFinReq, req, gr = self.finishedRequestGreenlets.pop()#get(block = False)
                     gr.currentRequest = req                 
                     if req.canceled is False:
                         gr.switch()
                     del gr
-                    if prioLastReq < prioFinReq:
-                        #print prioLastReq, prioFinReq
-                        break
+                    didSomething = True
                         
-                        
-                        
+                
                 task = None
                 try:
                     prioLastReq,task = self.graph.tasks.get(block = False)#timeout = 1.0)
@@ -2351,44 +2494,51 @@ class Worker(Thread):
                     prioLastReq = 0
                     pass                
                 if task is not None:
+                    didSomething = True
                     reqObject = task
                     if reqObject.canceled is False:
                         gr = CustomGreenlet(reqObject._execute)
+                        gr.lastRequest = None
+                        gr.currentRequest = reqObject
                         gr.thread = self
                         gr.switch( gr)
                         del gr
                         
-                if len(self.openUserRequests) < 4:
-                    self._hasSlept = True                    
+                if didSomething is False: # only start a new request if nothing else was done
                     task = None
                     try:
                         pr,task = self.graph.newTasks.get(block = False)#timeout = 1.0)
                     except Empty:
                         pass               
                     if task is not None:
+                        didSomething = True
                         reqObject = task
-                        self.openUserRequests.add(reqObject)                
                         if reqObject.canceled is False:
                             gr = CustomGreenlet(reqObject._execute)
                             gr.thread = self
+                            gr.lastRequest = None
+                            gr.currentRequest = reqObject
                             gr.switch( gr)
                             del gr
-                else:
-                    self._hasSlept = False
-                for r in self.openUserRequests.copy():
-                    if r.canceled or r._finished:
-                        self.openUserRequests.remove(r)
-                        self._hasSlept = True
-
+        self.graph.workers.remove(self)
 
     
 class Graph(object):
+
+    _runningGraphs = [] 
+
+    @atexit.register
+    def stopGraphs():
+       for g in Graph._runningGraphs:
+          g.stopGraph()
+
+
     def __init__(self, numThreads = None, softMaxMem =  None):
         self.operators = []
         self.tasks = PriorityQueue() #Lifo <-> depth first, fifo <-> breath first
         self.newTasks = PriorityQueue() #Lifo <-> depth first, fifo <-> breath first
         self.workers = []
-        self.freeWorkers = deque()
+        self.freeWorkers = set()
         self.running = True
         self.suspended = False
         self.stopped = False
@@ -2398,7 +2548,9 @@ class Graph(object):
         
         if numThreads is None:
             self.numThreads = detectCPUs()
-            if self.numThreads > 2:
+            if self.numThreads <= 2:
+              self.numThreads += 1
+            if self.numThreads > 3:
                 self.numThreads -= 1
         else:
             self.numThreads = numThreads
@@ -2420,18 +2572,18 @@ class Graph(object):
         self._allocatedCaches = deque()
         self._usedCacheMemory = 0
         self._memAllocLock = threading.Lock()
-
+        Graph._runningGraphs.append(self)
         self._startWorkers()
         
     def _startWorkers(self):
         self.workers = []
-        self.freeWorkers = deque()
+        self.freeWorkers = set()
         self.tasks = PriorityQueue()
         for i in xrange(self.numThreads):
             w = Worker(self)
             self.workers.append(w)
             w.start()
-            self.freeWorkers.append(w)        
+            self.freeWorkers.add(w)        
     
     def _memoryUsage(self):
         return self.process.get_memory_info().vms
@@ -2526,8 +2678,9 @@ class Graph(object):
                 self.newTasks.put((-task._requestLevel,task))
             if len(self.freeWorkers) > 0:
                 try:
-                    w = self.freeWorkers.popleft()
+                    w = self.freeWorkers.pop()
                     w.signalWorkAvailable()
+                    time.sleep(0)
                 except:
                     pass
         else:
@@ -2535,61 +2688,64 @@ class Graph(object):
 
     def putFinalize(self, reqObject):
         self._suspendedNotifyFinish.append(reqObject)
-
+    
     def stopGraph(self):
-        print "Graph: stopping..."        
-        self.stopped = True
-        self.suspendGraph()
+        if not self.stopped:
+            print "Graph: stopping..."        
+            self.stopped = True
+            self.suspendGraph()
 
     def suspendGraph(self):
-        print "Graph: suspending..."        
-        tasks = []
-        while not self.newTasks.empty():
-            try:
-                t = self.newTasks.get(block = False)
-                tasks.append(t)
-            except:
-                break
-        while not self.tasks.empty():
-            try:
-                t = self.tasks.get(block = False)
-                tasks.append(t)
-            except:
-                break
-        runningRequests = []
-        for t in tasks:
-            prio, req = t
-            if req.parentRequest is not None:
-                self.putTask(req)
-                runningRequests.append(req)
-            else:
-                self._suspendedRequests.append(req)
+        if not self.suspended:
+          tasks = []
+          while not self.newTasks.empty():
+              try:
+                  t = self.newTasks.get(block = False)
+                  tasks.append(t)
+              except:
+                  break
+          while not self.tasks.empty():
+              try:
+                  t = self.tasks.get(block = False)
+                  tasks.append(t)
+              except:
+                  break
+          runningRequests = []
+          for t in tasks:
+              prio, req = t
+              if req.parentRequest is not None:
+                  self.putTask(req)
+                  runningRequests.append(req)
+              else:
+                  self._suspendedRequests.append(req)
 
-        waitFor = sorted(runningRequests, key=lambda x: -x._requestLevel)
-        if len(waitFor) == 0:
-            print "   no requests that need to be waited for"
-        
-        for i,req in enumerate(waitFor):
-            s = "    Waiting for request %6d/%6d" % (i+1,len(waitFor))
-            sys.stdout.write(s)
-            sys.stdout.flush()
-            req.wait()
-            sys.stdout.write("\b"*len(s))
-        self.suspended = True
+          waitFor = sorted(runningRequests, key=lambda x: -x._requestLevel)
+          if len(waitFor) == 0:
+              print "   no requests that need to be waited for"
+          
+          for i,req in enumerate(waitFor):
+              s = "    Waiting for request %6d/%6d" % (i+1,len(waitFor))
+              sys.stdout.write(s)
+              sys.stdout.flush()
+              req.wait()
+              sys.stdout.write("\b"*len(s))
+          self.suspended = True
 
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+          sys.stdout.write("\n")
+          sys.stdout.flush()
 
-        print "    Waiting for workers..."          
-        while len(self.workers) != len(self.freeWorkers):
-            time.sleep(0.1)
-            #print len(self.workers),len(self.freeWorkers)
-        time.sleep(0.1)
-        while len(self.workers) != len(self.freeWorkers):
-            time.sleep(0.1)
-        print "    ok"
-        print "finished."
-        #self.finalize()
+          print "   Waiting for workers..."          
+          for w in self.workers:
+            w.signalWorkAvailable()
+          while len(self.workers) > len(self.freeWorkers):
+              time.sleep(0.1)
+              print len(self.workers),len(self.freeWorkers)
+          time.sleep(0.1)
+          while len(self.workers) > len(self.freeWorkers):
+              time.sleep(0.1)
+          print "   ok"
+          print "finished."
+          self._runningGraphs.remove(self)
             
     def resumeGraph(self):        
         if self.stopped:
@@ -2598,23 +2754,24 @@ class Graph(object):
             self._suspendedNotifyFinish = deque()
             for w in self.workers:
                 w.openUserRequests = set()            
-        print "Graph: resuming %d requests" % len(self._suspendedRequests)
-        self.suspended = False
-        
-        while len(self._suspendedNotifyFinish) > 0:
-            try:
-                r = self._suspendedNotifyFinish.pop()
-            except:
-                break
-            r._finalize()
+            print "Graph: resuming %d requests" % len(self._suspendedRequests)
+            self.suspended = False
             
-        while len(self._suspendedRequests) > 0:
-            try:
-                r = self._suspendedRequests.pop()
-            except:
-                break
-            self.putTask(r)
-        print "finished."
+            while len(self._suspendedNotifyFinish) > 0:
+                try:
+                    r = self._suspendedNotifyFinish.pop()
+                except:
+                    break
+                r._finalize()
+                
+            while len(self._suspendedRequests) > 0:
+                try:
+                    r = self._suspendedRequests.pop()
+                except:
+                    break
+                self.putTask(r)
+            self._runningGraphs.append(self)
+            print "finished."
 
         
     def finalize(self):
@@ -2622,7 +2779,8 @@ class Graph(object):
         for w in self.workers:
             w.signalWorkAvailable()
             w.join()
-    
+        self.stopGraph()
+
     def registerOperator(self, op):
         self.operators.append(op)
     
@@ -2632,161 +2790,29 @@ class Graph(object):
         op.disconnect()
  
     def dumpToH5G(self, h5g, patchBoard):
-        h5op = h5g.create_group("operators")
-        h5op.dumpObject(self.operators, patchBoard)
-
+        self.stopGraph()
         h5g.dumpSubObjects({
                     "operators" : self.operators,
                     "numThreads": self.numThreads,
-                    "softMaxMem": self.softMaxMem,
-                    "registeredCaches": self.registeredCaches
+                    "softMaxMem": self.softMaxMem
                 },patchBoard)    
+        self.resumeGraph()
 
     
     @classmethod
     def reconstructFromH5G(cls, h5g, patchBoard):
-        g = Graph(numThreads = h5g.attrs["numThreads"], softMaxMem = h5g.attrs["softMaxMem"])
-        patchBoard[h5g.attrs["id"]] = g 
+        numThreads = h5g["numThreads"].reconstructObject()
+        softMaxMem = h5g["softMaxMem"].reconstructObject()
 
-        patchBoard[h5g.attrs["id"]] = op
-        h5g.reconstructSubObjects(op, {
+        g = Graph(numThreads = numThreads, softMaxMem = softMaxMem)
+        patchBoard[h5g.attrs["id"]] = g 
+        g.stopGraph()
+        
+        h5g.reconstructSubObjects(g, {
                     "operators": "operators",
                     "numThreads": "numThreads",
-                    "softMaxMem" : "softMaxMem",
-                    "registeredCaches": "registeredCaches"
+                    "softMaxMem" : "softMaxMem"
                 },patchBoard)    
- 
+        g.resumeGraph()
         return g
  
-    def dumpToH5G_OLD(self,h5g):
-        endPoints = []
-        
-        # loop over all operators and
-        # and find the endpoints
-        for o in self.operators:
-            olength = 0
-            ilength = 0
-            for os in o.outputs.values():
-                olength += len(os.partners)
-            for k, ins in o.inputs.items():
-                if ins.partner is not None or ins.value is not None:
-                    ilength += 1
-            # if an operator has no outputs but inputs
-            # it belongs to the graph and is an endpoint
-            if olength == 0 and ilength > 0:
-                ooooo = o._getOriginalOperator()
-                if ooooo not in endPoints:
-                    endPoints.append(ooooo)                
-                
-        queue = endPoints
-        
-        doneQueue = []
-        
-        # loop over all operators in the queue
-        # (i.e. the endpoints in the beginning)
-        # and append all inputs operators on which
-        # they depend onto the queue
-        # -> we construct the dependency graph in
-        #    a breadth first manner
-        while len(queue) > 0:
-            op = queue.pop(0)
-            doneQueue.append(op)
-            for i in op.inputs.values():
-                if i.partner is not None:
-                    p = i.partner
-                    # we use the metaParent to allow for operatorGroups and operatorWrappers
-                    assert p._metaParent is not None, "%r, %r" % (p.name, p.operator)
-                    partnerOp = p._metaParent._getOriginalOperator()
-                    if partnerOp not in queue and partnerOp not in doneQueue:
-                        queue.append(partnerOp)
-        
-        # we reverse the dependencies
-        # since the graph has to be reconstructed beginning from the inputs
-        doneQueue.reverse()
-
-        # create subgroups for the operators, inslot values and connections themself                        
-        h5ops = h5g.create_group("operators")
-        h5values = h5g.create_group("inslot_values")
-        h5gconnections = h5g.create_group("connections")
-        
-        #save the operator class names and ids
-        for i,op in enumerate(doneQueue):
-            opG = h5ops.create_group(str(id(op)))
-            opG.attrs["id"] = str(id(op))
-            opG.attrs["class"] = instanceClassToString(op)
-                    
-        connections = []
-
-        # save the connections between the operators
-        # and potential .value, so that everything can be restored 
-        for i,op in enumerate(doneQueue):
-            for key,inslot in op.inputs.items():
-                #save a connection
-                val = inslot.value
-                if inslot.partner is not None:
-                    partnerOp = inslot.partner.operator._getOriginalOperator()
-                    partnerSlotName = inslot.partner.name
-                    connections.append(["connect", [str(id(op)),key,str(id(partnerOp)), partnerSlotName]])                    
-                elif val is not None:
-                    #save the value in to the dedicated value group
-                    connections.append(["setValue", [str(id(op)), key, str(id(val))]])
-                    valG = h5values.create_group(str(id(val)))
-                    valG.dumpObject(val)
-        
-        # save the connectino nested lists recursively
-        h5gconnections.dumpObject(connections)
-        
-        
-    @classmethod
-    def reconstructFromH5G_OLD(cls, h5g, patchBoard):
-        graph = Graph()
-        
-        reconstructedOperators = {}        
-        reconstructedValues = {}
-        
-        h5ops = h5g["operators"]
-        h5values = h5g["inslot_values"]
-        connections = h5g["connections"].reconstructObject()
-        
-        def getReconstructedOperator(opId):
-            """
-            helper method to map an operatorId string to an reconstructed object
-            """
-            op = reconstructedOperators.get(opId,None)
-            if op is None:
-                # if the operator is accessed for the first tim
-                # construct the object once
-                opClassName = h5ops[opId].attrs["class"]
-                opClass = stringToClass(opClassName)
-                reconstructedOperators[opId] = op = opClass(graph)
-            return op
-
-        def getReconstructedValue(valueId):
-            """
-            helper method to map an valueId string to an reconstructed object
-            """
-            value = reconstructedValues.get(valueId,None)
-            if value is None:
-                # if the valueId is accessed for the first tim
-                # construct the object once
-                reconstructedValues[valueId] = value = h5values[valueId].reconstructObject()
-            return value
-
-                
-        for c in connections:
-            operation, arguments = c
-            if operation == "connect":
-                opInId, inSlotName, opOutId,outSlotName = arguments
-                opInObject = getReconstructedOperator(opInId)
-                opOutObject = getReconstructedOperator(opOutId)
-                opInObject.inputs[inSlotName].connect(opOutObject.outputs[outSlotName])
-                
-            elif operation == "setValue":
-                opId, inSlotName, valueId = arguments
-                op = getReconstructedOperator(opId)
-                value = getReconstructedValue(valueId)
-                op.inputs[inSlotName].setValue(value)
-                
-        return graph
-                
-     

@@ -85,9 +85,15 @@ class OpMultiArrayPiper(Operator):
     def notifySubConnect(self, slots, indexes):
         self.notifyConnectAll()
 
+    def notifySubSlotInsert(self,slots,indexes):
+        self.outputs["MultiOutput"]._insertNew(indexes[0])
+
     def notifySubSlotRemove(self, slots, indexes):
         self.outputs["MultiOutput"].pop(indexes[0])
     
+    def notifySubSlotResize(self,slots,indexes,size,event):
+        self.outputs["MultiOutput"].resize(size,event = event)
+
     def getOutSlot(self, slot, key, result):
         raise RuntimeError("OpMultiPipler does not support getOutSlot")
 
@@ -413,6 +419,9 @@ class OpArrayCache(OpArrayPiper):
         half = tileArray.shape[0]/2
         dirtyRequests = []
 
+        def onCancel():
+            return False # indicate that this request cannot be canceled
+            
         for i in range(tileArray.shape[1]):
 
             drStart3 = tileArray[:half,i]
@@ -435,6 +444,8 @@ class OpArrayCache(OpArrayPiper):
     
                 req = self.inputs["Input"][key].writeInto(self._cache[key])
                 
+                req.onCancel(onCancel)
+
                 dirtyRequests.append((req,key2, key3))   
     
                 self._blockQuery[key2] = req
@@ -458,18 +469,10 @@ class OpArrayCache(OpArrayPiper):
             blockSet[:]  = fastWhere(cond, 0, blockSet, numpy.uint8)
         self._lock.release()
         
-        def onCancel(cancelled, reqBlockKey, reqSubBlockKey):
-            if cancelled.next() == 0:
-                self._lock.acquire()
-                blockSet = fastWhere(cond, 1, blockSet, numpy.uint8)
-                self._blockQuery[blockKey] = fastWhere(cond, None, self._blockQuery[blockKey], object)                       
-                self._lock.release()            
-            
         temp = itertools.count(0)        
             
         #wait for all requests to finish
         for req, reqBlockKey, reqSubBlockKey in dirtyRequests:
-            req.onCancel(onCancel, cancelled = temp, reqBlockKey = reqBlockKey, reqSubBlockKey = reqSubBlockKey)
             res = req.wait()
 
         # indicate the finished inprocess state
@@ -536,7 +539,7 @@ class OpArrayCache(OpArrayPiper):
                     "_blockState" : self._blockState,
                     "_dirtyState" : self._dirtyState,
                     "_cache" : self._cache,
-                    "_allocateCache" : self._allocateCache,
+                    "_lazyAlloc" : self._lazyAlloc,
                     "_cacheHits" : self._cacheHits,
                     "_fixed" : self._fixed
                 },patchBoard)    
@@ -559,7 +562,7 @@ class OpArrayCache(OpArrayPiper):
                     "_dirtyState" : "_dirtyState",
                     "_dirtyShape" : "_dirtyShape",
                     "_cache" : "_cache",
-                    "_allocateCache" : "_allocateCache",
+                    "_lazyAlloc" : "_lazyAlloc",
                     "_cacheHits" : "_cacheHits",
                     "_fixed" : "_fixed"
                 },patchBoard)    
@@ -958,21 +961,23 @@ class OpBlockedArrayCache(OperatorGroup):
             
 
     def getOutSlot(self, slot, key, result):
+        #return
         
         #find the block key
         start, stop = sliceToRoi(key, self.shape)
-        blockStart = numpy.floor(1.0 * start / self._blockShape)
-        blockStop = numpy.ceil(1.0 * stop / self._blockShape)
-        blockStop = numpy.where(stop == self.shape, self._dirtyShape, blockStop)
+        
+        blockStart = (start / self._blockShape)
+        blockStop = (stop * 1.0 / self._blockShape).ceil()
+        #blockStop = numpy.where(stop == self.shape, self._dirtyShape, blockStop)
         blockKey = roiToSlice(blockStart,blockStop)
         innerBlocks = self._blockNumbers[blockKey]
-        result[:] = 0
 
         if lazyflow.verboseRequests:
-            print "OpSparseArrayCache %r: request with key %r for %d inner Blocks " % (self,key, len(innerBlocks.ravel()))    
+            print "OpSparseArrayCache %r: request with key %r for %d inner Blocks " % (self,key, len(innerBlocks.ravel()))
+
         
         requests = []
-        for b_ind in innerBlocks.ravel():
+        for b_ind in innerBlocks.flat:
             #which part of the original key does this block fill?
             offset = self._blockShape*self._flatBlockIndices[b_ind]
             bigstart = numpy.maximum(offset, start)
@@ -984,7 +989,6 @@ class OpBlockedArrayCache(OperatorGroup):
             smallstop = bigstop - offset
             
             diff = smallstop - smallstart
-            minimum = numpy.min(diff)
             smallkey = roiToSlice(smallstart, smallstop)
                 
             bigkey = roiToSlice(bigstart-start, bigstop-start)
@@ -1007,19 +1011,17 @@ class OpBlockedArrayCache(OperatorGroup):
                     #self._cache_list[b_ind].inputs["fixAtCurrent"].connect(self.fixerSource.outputs["Output"])
                     self._cache_list[b_ind].inputs["fixAtCurrent"].connect(self.fixerSource.outputs["Output"])
                     self._cache_list[b_ind].inputs["blockShape"].setValue(self.inputs["innerBlockShape"].value)
+            self._lock.release()
 
             if self._cache_list.has_key(b_ind):
-                req = self._cache_list[b_ind].outputs["Output"][smallkey].writeInto(result[bigkey])
-                self._lock.release()
-                #res = req.wait()
-                requests.append(req)
-            else:
-                self._lock.release()
+                op = self._cache_list[b_ind]
+                #req = self._cache_list[b_ind].outputs["Output"][smallkey].writeInto(result[bigkey])
+                op.getOutSlot(op.outputs["Output"],smallkey,result[bigkey])
+                #requests.append(req)
         
         for r in requests:
           r.wait()
 
-        return result
 
     def notifyDirty(self, slot, key):
         if slot == self.inputs["Input"] and not self._fixed:
