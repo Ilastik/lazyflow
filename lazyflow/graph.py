@@ -964,6 +964,12 @@ class OutputSlot(object):
         the method notifies all InputSlots that are connected to
         this output slot
         """
+
+        if self.shape is None:
+            #if we have not yet received a shape,
+            #do not propagate dirtyness
+            return
+        
         start, stop = sliceToRoi(key, self.shape)
         key = roiToSlice(start,stop)
         for p in self.partners:
@@ -1638,18 +1644,35 @@ class Operator(object):
         #provide simple default name for lazy users
         if self.name == "": 
             self.name = type(self).__name__
-        assert self.graph is not None, "Operators must be given a graph, they cannot exist alone!" 
+        assert self.graph is not None, "Operators must be given a graph, they cannot exist alone!"
+        
+        # check for slot uniqueness
+        temp = {}
+        for i in self.inputSlots:
+          if temp.has_key(i.name):
+            raise Exception("ERROR: Operator %s has multiple slots with name %s, please make sure that all input and output slot names are unique" % (self.name, i.name))
+            sys.exit(1)
+          temp[i.name] = True
+
+        for i in self.outputSlots:
+          if temp.has_key(i.name):
+            raise Exception("ERROR: Operator %s has multiple slots with name %s, please make sure that all input and output slot names are unique" % (self.name, i.name))
+            sys.exit(1)
+          temp[i.name] = True
+
         # replicate input slot connections
         # defined for the operator for the instance
         for i in self.inputSlots:
             ii = i.getInstance(self)
             ii.connect(i.partner)
             self.inputs[i.name] = ii
+            setattr(self,i.name,ii)
         # replicate output slots
         # defined for the operator for the instance 
         for o in self.outputSlots:
             oo = o.getInstance(self)
             self.outputs[o.name] = oo         
+            setattr(self,o.name,oo)
             # output slots are connected
             # when the corresponding input slots
             # of the partner operators are created  
@@ -1963,6 +1986,7 @@ class OperatorWrapper(Operator):
                 level = islot.level + 1
                 ii = MultiInputSlot(islot.name, self, stype = islot._stype, level = level)
                 self.inputs[islot.name] = ii
+                setattr(self,islot.name,ii)
                 op = self.operator
                 while isinstance(op.operator, (Operator, MultiInputSlot, OperatorGroup)):
                     op = op.operator
@@ -1973,6 +1997,7 @@ class OperatorWrapper(Operator):
                 level = oslot.level + 1
                 oo = MultiOutputSlot(oslot.name, self, stype = oslot._stype, level = level)
                 self.outputs[oslot.name] = oo
+                setattr(self,oslot.name,oo)
                 op = self.operator
                 while isinstance(op.operator, (Operator, MultiOutputSlot)):
                     op = op.operator
