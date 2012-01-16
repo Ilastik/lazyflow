@@ -33,9 +33,12 @@ import ilastik.gui
 
 from ilastik.gui import loadOptionsWidget
 from ilastik.core import loadOptionsMgr
+from lazyflow.graph import OperatorGroup, InputSlot, OutputSlot
+from lazyflow.operators.vigraOperators import *
 
 
 from PyQt4 import QtCore, QtGui
+from shutil import rmtree
 
 #*******************************************************************************
 # S t a c k L o a d e r                                                        *
@@ -48,7 +51,7 @@ class StackLoader(QtGui.QDialog):
         self.setMinimumWidth(400)
         self.layout = QtGui.QVBoxLayout()
         self.setLayout(self.layout)
-
+        
         #a list of filenames
         #internally, it's a list of lists of filenames
         #for each channel
@@ -180,23 +183,186 @@ class StackLoader(QtGui.QDialog):
             return  str(self.path.text()), self.fileList, self.options
         else:
             return None, None, None
-       
-def test():
-    """Text editor demo"""
-    #from spyderlib.utils.qthelpers import qapplication
-    app = QtGui.QApplication([""])
+
+
+class OpStackChainBuilder(OperatorGroup):
+    name = "OpStackChainBuilder"
+    inputSlots = [InputSlot("globstring"),InputSlot("convert"),InputSlot("invert")]
+    outputSlots = [OutputSlot("output")]
     
-    dialog = StackLoader()
-    print dialog.show()
-    app.exec_()
+    def _createInnerOperators(self):
+        
+        self.Loader = OpStackLoader(self.graph)
+        self.Inverter = OpGrayscaleInverter(self.graph)
+        self.OutPiper = OpArrayPiper(self.graph)
+        self.GrayConverter = OpRgbToGraysacle(self.graph)
+    
+    def notifyConnectAll(self):
+        
+        #FIXME: get a system into the outslot setups. not complete or systematical.
+                
+        self.Loader.inputs["globstring"].setValue(self.inputs["globstring"].value)
+        
+        if self.inputs["invert"].value and not self.inputs["convert"].value:
+            self.Inverter.inputs["input"].connect(self.Loader.outputs["stack"])
+            self.OutPiper.inputs["Input"].connect(self.Inverter.outputs["output"])
+        
+        elif self.inputs["convert"].value and not self.inputs["invert"].value:
+            self.GrayConverter.inputs["input"].connect(self.Loader.outputs["stack"])
+            self.OutPiper.inputs["Input"].connect(self.GrayConverter.outputs["output"])
+            
+            self.outputs["output"]._dtype = self.GrayConverter.outputs["output"]._dtype
+            self.outputs["output"]._axistags = self.GrayConverter.outputs["output"]._axistags
+            self.outputs["output"]._shape = self.GrayConverter.outputs["output"]._shape
+            
+        elif self.inputs["convert"].value and self.inputs["invert"].value:
 
+            self.Inverter.inputs["input"].connect(self.Loader.outputs["stack"])
+            self.GrayConverter.inputs["input"].connect(self.Inverter.outputs["output"])
+            self.OutPiper.inputs["Input"].connect(self.GrayConverter.outputs["output"])
+            
+            self.outputs["output"]._dtype = self.GrayConverter.outputs["output"]._dtype
+            self.outputs["output"]._axistags = self.GrayConverter.outputs["output"]._axistags
+            self.outputs["output"]._shape = self.GrayConverter.outputs["output"]._shape
 
+        elif not self.inputs["convert"].value and not self.inputs["invert"].value:
+            
+            self.OutPiper.inputs["Input"].connect(self.Loader.outputs["stack"])
+            
+            self.outputs["output"]._dtype = self.Loader.outputs["stack"]._dtype
+            self.outputs["output"]._axistags = self.Loader.outputs["stack"]._axistags
+            self.outputs["output"]._shape = self.Loader.outputs["stack"]._shape
+
+        
+        
+
+    def getOutSlot(self, slot, key, result):
+        
+        if slot.name == "output":
+            if self.inputs["invert"].connected():
+                result = self.Inverter.outputs["output"][:].allocate().wait()
+            else:
+                result = self.Loader.outputs["stack"][:].allocate().wait()
+        
+    def getInnerInputs(self):
+        inputs = {}
+        inputs["input"] = self.Loader.inputs["globstring"]
+        return  inputs
+
+    def getInnerOutputs(self):
+        outputs = {}
+        outputs["output"] = self.OutPiper.outputs["Output"]
+        return outputs
+
+       
+    
+class TestOperatorChain():
+    
+    def __init__(self,testdirectory='./testImages/',imagedimension = (200,200,50,3),configuration = (False,False)):
+        
+        self.testdir = testdirectory
+        self.dim = imagedimension
+        self.config = configuration
+        self.result = None
+        self.block = None
+        
+
+        self.createImages()
+        
+        
+    def createImages(self):
+
+        if not os.path.exists(self.testdir):
+            print "creating directory '%s'" % (self.testdir)
+            os.mkdir(self.testdir)
+        self.block = numpy.random.rand(self.dim[0],self.dim[1],self.dim[2],self.dim[3])*255
+        self.block = self.block.astype('uint8')
+        for i in range(self.dim[2]):
+            vigra.impex.writeImage(self.block[:,:,i,:],self.testdir+"%04d.png" % (i))
+    
+        
+    def stackAndTestFull(self,filetype = "png"):
+
+        g = Graph()
+        OpChain = OpStackChainBuilder(g)
+        OpChain.inputs["globstring"].setValue(self.testdir + '*.png')
+        result = OpChain.outputs["output"][:].allocate().wait()
+        assert(result == self.block).all()
+    
+    def stackAndTestConfig(self,filetype = "png"):
+        
+        g = Graph()
+        OpChain = OpStackChainBuilder(g)
+        OpChain.inputs["globstring"].setValue(self.testdir + '*.png')
+        
+        #CONFIGURE THE OPERATORCHAIN
+        #-----------------------------------------------------------------------
+        
+        #config(False,False) - No Inv, No Conv
+        if self.config[0] == False and self.config[1] == False:
+            OpChain.inputs["invert"].setValue(False)
+            OpChain.inputs["convert"].setValue(False)
+        
+        #config(True,False) - Inv, No Conv
+        if self.config[0] == True and self.config[1] == False:
+            OpChain.inputs["invert"].setValue(True)
+            OpChain.inputs["convert"].setValue(False)
+            
+        #config(True,False) - No Inv, Conv
+        if self.config[0] == False and self.config[1] == True:
+            OpChain.inputs["invert"].setValue(False)
+            OpChain.inputs["convert"].setValue(True)
+            
+        #config(True,True) - Inv, Conv
+        if self.config[0] == True and self.config[1] == True:
+            OpChain.inputs["convert"].setValue(True)
+            OpChain.inputs["invert"].setValue(True)
+
+        #OBTAIN THE RESULT
+        #-----------------------------------------------------------------------
+
+        result = OpChain.outputs["output"][:].allocate().wait()
+        
+        
+        #TEST THE RESULT
+        #-----------------------------------------------------------------------
+        
+        #config(False,False) - No Inv, No Conv
+        if self.config[0] == False and self.config[1] == False :
+            assert(result == self.block).all()
+        
+        #config(True,False) - Inv, No Conv
+        if self.config[0] == True and self.config[1] == False:
+            for i in range(result.shape[-1]):
+                assert(result[:,:,:,i] == 255-self.block[:,:,:,i]).all()
+        
+        #config(False,True) - No Inv, Conv
+        if self.config[0] == False  and self.config[1] == True:
+            for i in range(result.shape[-1]):
+                assert(result[:,:,:,i] == (numpy.round(0.299*self.block[:,:,:,0] + 0.587*self.block[:,:,:,1] + 0.114*self.block[:,:,:,2])).astype(int)).all()
+        
+        #config(True,True) - Inv, Conv
+        if self.config[0] == True  and self.config[1] == True:
+            for i in range(self.block.shape[-1]):
+                self.block[:,:,:,i] = 255-self.block[:,:,:,i]
+            for i in range(result.shape[-1]):
+                assert(result[:,:,:,i] == (numpy.round(0.299*self.block[:,:,:,0] + 0.587*self.block[:,:,:,1] + 0.114*self.block[:,:,:,2])).astype(int)).all()
+        
+        
+        
+        
+    def cleanUp(self):
+        os.rmdir(self.testdirectory) 
+   
 #*******************************************************************************
 # i f   _ _ n a m e _ _   = =   " _ _ m a i n _ _ "                            *
 #*******************************************************************************
 
 if __name__ == "__main__":
-    test()
+    
+    # configuration=(intert?[True/False],converttoGrayscale?[True/False])
+    testclass = TestOperatorChain(configuration=(True,True))
+    testclass.stackAndTestConfig()
 
 
 
