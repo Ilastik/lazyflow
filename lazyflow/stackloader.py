@@ -175,7 +175,7 @@ class StackLoader(QtGui.QDialog):
         tempLayout.addWidget(self.loadButton)
         self.layout.addStretch()
         self.layout.addLayout(tempLayout)
-
+        self.show()
         self.image = None
 
     def pathChanged(self, text):
@@ -339,7 +339,6 @@ if __name__ == "__main__":
     if '-gui' in sys.argv:
         app = QtGui.QApplication([""])
         dialog = StackLoader()
-        print dialog.show()
         app.exec_()
 
 
