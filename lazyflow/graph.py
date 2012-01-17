@@ -50,7 +50,6 @@ import itertools
 
 from h5dumprestore import instanceClassToString, stringToClass
 from helpers import itersubclasses, detectCPUs
-from roi import sliceToRoi, roiToSlice
 from collections import deque
 from Queue import Queue, LifoQueue, Empty, PriorityQueue
 from threading import Thread, Event, current_thread, Lock
@@ -58,6 +57,9 @@ import greenlet
 import weakref
 import threading
 
+import rtype
+from roi import sliceToRoi, roiToSlice
+from lazyflow.stype import ArrayLike
 
 greenlet.GREENLET_USE_GC = False #use garbage collection
 sys.setrecursionlimit(100000)
@@ -68,7 +70,7 @@ class DefaultConfigParser(ConfigParser.SafeConfigParser):
     """
     Simple extension to the default SafeConfigParser that
     accepts a default parameter in its .get method and
-    returns its valaue when the parameter cannot be found
+    returns its value when the parameter cannot be found
     in the config file instead of throwing an exception
     """
     def __init__(self):
@@ -111,6 +113,24 @@ except:
     if not os.path.exists(CONFIG_DIR):
         os.mkdir(CONFIG_DIR)
     CONFIG = DefaultConfigParser()
+
+def warn_deprecated( msg ):
+    warn = True
+    if CONFIG.has_option("verbosity", "deprecation_warnings"):
+        warn = CONFIG.getboolean("verbosity", "deprecation_warnings")
+    if warn:
+        import inspect
+        import os.path
+        fi = inspect.getframeinfo(inspect.currentframe().f_back)
+        print "DEPRECATION WARNING: in", os.path.basename(fi.filename), "line", fi.lineno, ":", msg
+
+# deprecation warning decorator
+def deprecated( fn ):
+    def warner(*args, **kwargs):
+        warn_deprecated( fn.__name__ )
+        return fn(*args, **kwargs)
+    return warner
+
 
 
 class Operators(object):
@@ -158,65 +178,6 @@ class CopyOnWriteView(object):
     
     def __getitem__(self,key):
         return self._data[key]
-
-      
-      
-class GetItemWriterObject(object):
-    """
-    Enables the syntax:
-
-    InputSlot[:,:].writeInto(array)
-    InputSlot[:,:].allocate()
-    
-    for requesting data from an input or output slot of an operator.
-    
-    An instance of this class is returned by a call to a __getitem__ (i.e. [key])
-    method call of any InputSlot or OutputSlot.
-    """
-    
-    __slots__ = ["_key", "_start", "_stop","_slot"]
-    
-    def __init__(self, slot, key):
-        self._start, self._stop = sliceToRoi(key, slot.shape)
-        self._key = roiToSlice(self._start,self._stop)        
-        self._slot = slot
-    
-    def writeInto(self, destination, priority = 0):
-        """
-        the writeInto method ensures that the data
-        that is requested from an InputSlot or OutputSlot is written
-        into the specified numpy.ndarray
-        
-        of course the destination numpy.ndarray must have
-        the same size/shape/dimension as the slot will
-        return in reponse to the requested key
-        """
-        if destination is not None:
-            diff = self._start - self._stop
-            shape = list(destination.shape)
-            assert len(diff) == len(shape), "GetItemWriterObject: writeInto - somebody provided result area that has a different shape then the request key itself ! resultarea shape = %r, key = %r" % (destination.shape, self._key)
-            assert diff == shape, "GetItemWriterObject: writeInto - somebody provided result area that has a different shape then the request key itself ! resultarea shape = %r, key = %r" % (destination.shape, self._key)
-        return  GetItemRequestObject(self, self._slot, self._key, destination, priority)
-  
-    def allocate(self, axistags = False, priority = 0):
-        """
-print "\n\n"
-        if the user does not want lazyflow to write calculation
-        results into a specific numpy array he can use
-        the .allocate() call.
-        
-        a destination array of required size,shape,dtype will
-        be constructed in which the results will be written.
-        """
-        #destination = self._slot._allocateStorage(self._start, self._stop, axistags)
-        #destination = CopyOnWriteView(self._slot.shape, self._slot.dtype)
-        return self.writeInto(None, priority)
-    
-    def __call__(self):
-        #TODO: remove this convenience function when
-        #      everything is ported ?
-        return self.allocate()
-
       
 class CustomGreenlet(greenlet.greenlet):
     __slots__ = ("lastRequest","currentRequest","thread")
@@ -238,22 +199,17 @@ class GetItemRequestObject(object):
     InputSlot[:,:].writeInto(array).wait() or
     InputSlot[:,:].writeInto(array).notify(someFunction)
     
-    the GetItemRequestObject is responsible for the
-    .wait() and .notify() part of the above statements.
-    
-    It is returned by all method calls to an GetItemWriterObject (which
-    in turn is returned by a call to the __getitem__ method of an
-    InputSlot and OutputSlot) 
+    It is returned by a call to the __getitem__ method of Slot.
+ 
     """
 
-    __slots__ = ["_writer", "key", "destination", "slot", "func", "canceled",
+    __slots__ = ["roi", "destination", "slot", "func", "canceled",
                  "_finished", "inProcess", "parentRequest", "childRequests",
                  "graph", "waitQueue", "notifyQueue", "cancelQueue",
                  "_requestLevel", "arg1", "lock", "_priority"]
         
-    def __init__(self, writer, slot, key, destination, priority):
-        self._writer = writer        
-        self.key = key
+    def __init__(self, slot, roi, destination, priority):        
+        self.roi = roi
         self._priority = priority
         self.destination = destination
         self.slot = slot
@@ -271,10 +227,10 @@ class GetItemRequestObject(object):
         self._requestLevel = -1
         self.lock = Lock()
         if isinstance(slot, InputSlot) and self.slot._value is None:
-            self.func = slot.partner.operator.getOutSlot
+            self.func = slot.partner.operator._execute
             self.arg1 = slot.partner            
         elif isinstance(slot, OutputSlot):
-            self.func =  slot.operator.getOutSlot
+            self.func =  slot.operator._execute
             self.arg1 = slot
         else:
             # we are in the ._value case of an inputSlot
@@ -322,10 +278,10 @@ class GetItemRequestObject(object):
         self.inProcess = True
         temp = gr.currentRequest
         if self.destination is None:
-            self.destination = self.slot._allocateStorage(self._writer._start, self._writer._stop, False)
+            self.destination = self.slot._allocateDestination( self.roi )
         gr.currentRequest = self
         try:
-          self.func(self.arg1,self.key, self.destination)
+          self.func(self.arg1,self.roi, self.destination)
         except Exception,e:
           if isinstance(self.slot, InputSlot):
             print
@@ -352,7 +308,16 @@ class GetItemRequestObject(object):
         self.lock.release()
         for c in childs:
             c.adjustPriority(delta)
-        
+
+    def writeInto(self, destination, priority = 0):
+        self.destination = destination
+        self._priority = priority
+        return self
+
+    @deprecated
+    def allocate(self, priority = 0):
+        return self.writeInto( None, priority)
+
     def wait(self, timeout = 0):
         """
         calling .wait() on an RequestObject is a blocking
@@ -444,15 +409,12 @@ class GetItemRequestObject(object):
               pass
         else:
             if self.destination is None:
-                self.destination = self.slot._allocateStorage(self._writer._start, self._writer._stop, False)
-            try:
-                self.destination[:] = self.slot._value[self.key]
-            except (AttributeError, TypeError): # not an array
-                self.destination[:] = self.slot._value
+                self.destination = self.slot._allocateDestination(self.roi)
+            self.slot._writeIntoDestination(self.destination, self.slot._value, self.roi)
         self._finished = True
         if self.canceled is False:
           assert self.destination is not None
-          return self.destination
+          return self.slot._returnDestination(self.destination)
         else:
           return None
   
@@ -604,7 +566,88 @@ class GetItemRequestObject(object):
     def __call__(self):
         assert 1==2, "Please use the .wait() method, () is deprecated !"
 
-class InputSlot(object):
+
+
+class Slot(object):
+    """Common methods of all slot types."""
+
+    @property
+    def graph(self):
+        return self.operator.graph
+                        
+    def __init__( self, stype = ArrayLike, rtype = rtype.SubRegion):
+        if self.__class__ == Slot: # make Slot constructor "private"
+            raise Exception("Slot can't be constructed directly; use one of the derived slot types")
+        if type(stype) == str:
+          stype = ArrayLike
+        self.stype = stype(self)
+        self.rtype = rtype
+        self.meta = MetaDict()
+
+    def _allocateDestination( self, key ):
+        return self.stype.allocateDestination(key)
+        
+    def _writeIntoDestination( self, destination, value,roi ):
+        self.stype.writeIntoDestination(destination,value, roi)
+
+    def _returnDestination(self, destination):
+        return self.stype.returnDestination(destination)
+
+    @deprecated
+    def __getitem__(self, key):
+        """
+        operator.slot[] is obsolete;
+        please use the operator.slot() api from now on, i.e. the callable interface...
+        """
+        assert self.meta.shape is not None, "OutputSlot.__getitem__: self.shape=None (operator [self=%r] '%s'" % (self.operator, self.name)
+        return self(pslice=key)
+
+
+    def __call__(self, *args, **kwargs):
+      """
+      new API
+
+      the slot relays all arguments to the __init__ method
+      of the Roi type. this allows lazyflow to support different
+      types of rois without knowing anything about them.
+      """
+      roi = self.rtype(self,*args, **kwargs) if (args or kwargs) else None
+      return self.get( roi )
+
+    def get( self, roi ):
+      return GetItemRequestObject(self,roi,None,0)        
+
+
+import copy
+
+class MetaDict(dict):
+  def __init__(self, other=False):
+    if(other):
+      dict.__init__(self,other)
+    else:
+      dict.__init__(self)
+    self._dirty = True
+    #TODO: remove this, only for backwards compatability
+    if not self.has_key("shape"):
+      self.shape = None
+    if not self.has_key("dtype"):
+      self.dtype = None
+    if not self.has_key("axistags"):
+      self.axistags = None
+
+  def __setattr__(self,name,value):
+    if self.has_key(name) and self[name] != value:
+      self._dirty = True
+    self[name] = value
+    return value
+
+  def __getattr__(self,name):
+    return self[name]
+
+  def copy(self):
+    return MetaDict(dict.copy(self))
+
+class InputSlot(Slot):
     """
     The base class for input slots, it provides methods
     to connect the InputSlot to an OutputSlot of another
@@ -613,18 +656,32 @@ class InputSlot(object):
     """
     
     __slots__ = ["name", "operator", "partner", "level", 
-                 "_value", "_stype", "axistags", "shape", "dtype"]    
+                 "_value", "stype", "rtype", "axistags", "shape", "dtype"]    
     
-    def __init__(self, name, operator = None, stype = "ndarray"):
+    def __init__(self, name, operator = None, stype = ArrayLike, rtype=rtype.SubRegion):
+        super(InputSlot, self).__init__(stype = stype, rtype=rtype)
         self.name = name
         self.operator = operator
         self.partner = None
         self.level = 0
         self._value = None
-        self._stype = stype
-        self.axistags = None
-        self.shape = None
-        self.dtype = None
+ 
+
+    @property
+    def shape(self):
+      return self.meta.shape
+
+    @property
+    def dtype(self):
+      return self.meta.dtype
+
+    @property
+    def axistags(self):
+      return self.meta.axistags
+
+    def _changed(self, notify = True):
+      self._checkNotifyConnect(notify = notify)
+      self._checkNotifyConnectAll(notify = notify)
 
     def setValue(self, value, notify = True):
         """
@@ -633,20 +690,10 @@ class InputSlot(object):
         of connecting it to a partner OutputSlot.
         """
         assert self.partner == None, "InputSlot %s (%r): Cannot dot setValue, because it is connected !" %(self.name, self)
-        self._value = value
-
-        try:
-            self.shape = value.shape
-            self.dtype = value.dtype
-            if hasattr(value, "axistags"):
-                self.axistags = value.axistags
-            else:
-                self.axistags = vigra.defaultAxistags(len(value.shape))
-        except (AttributeError, TypeError): # not an array like value
-            self.shape = (1,)
-            self.dtype = object
-            self.axistags = vigra.defaultAxistags(1)
-        self._checkNotifyConnect(notify = notify)
+        if self.stype.isCompatible(value):
+          self._value = value
+          self.stype.setupMetaForValue(value)
+          self._changed(notify = notify)
 
     @property
     def value(self):
@@ -702,14 +749,12 @@ class InputSlot(object):
             
         else:
             self.partner = partner
-            self.dtype = partner.dtype
-            self.axistags = partner.axistags
-            self.shape = partner.shape
+            self.meta = partner.meta.copy()
             partner._connect(self)
             # do a type check
             self.connectOk(self.partner)
-            if self.shape is not None:
-                self._checkNotifyConnect(notify = notify)
+            if self.meta.shape is not None:
+                self._changed()
     
     def _checkNotifyConnect(self, notify = True):
         if self.operator is not None:
@@ -735,7 +780,7 @@ class InputSlot(object):
                     allConnected = False
                     break
             if allConnected:
-                self.operator._notifyConnectAll()
+                self.operator._setupOutputs()
                 
     def disconnect(self):
         """
@@ -746,14 +791,13 @@ class InputSlot(object):
         if self.partner is not None:
             self.partner.disconnectSlot(self)
         self.partner = None
-        self.dtype = None
-        self.axistags = None
-        self.shape = None
+        self.meta = MetaDict()
+        
     
     #TODO RENAME? createInstance
     # def __copy__ ?, clone ?
     def getInstance(self, operator):
-        s = InputSlot(self.name, operator, stype = self._stype)
+        s = InputSlot(self.name, operator, stype = type(self.stype))
         return s
             
     def setDirty(self, key):
@@ -773,30 +817,6 @@ class InputSlot(object):
         # if you want a more involved
         # type checking
         return True
-
-    def __getitem__(self, key):
-        """
-        retrieve the array content from the partner OutputSlot
-        
-        the method supports the array access interface.
-        
-        allows to call inputslot[0,:,3:11] 
-        """
-        if type(key) == tuple:
-          assert len(key) == len(self.shape)
-        start, stop = sliceToRoi(key, self.shape)
-        assert len(stop) == len(self.shape)
-        assert stop <= list(self.shape)
-        assert start >= [0]*len(self.shape)
-        assert self.partner is not None or self._value is not None, "cannot do __getitem__ on Slot %s, of %r Not Connected!" % (self.name, self.operator)
-        return GetItemWriterObject(self, key)
-
-    def _allocateStorage(self, start, stop, axistags = False):
-        storage = numpy.ndarray(stop - start, dtype=self.dtype)
-        if axistags is True:
-           storage = vigra.VigraArray(storage, storage.dtype, axistags = copy.copy(self.axistags))
-#        key = roiToSlice(start,stop) #we need a fully specified key e.g. not [:] but [0:10,0:17] !!
-        return storage
             
     def __setitem__(self, key, value):
         assert self.operator is not None, "cannot do __setitem__ on Slot '%s' -> no operator !!"     
@@ -805,10 +825,6 @@ class InputSlot(object):
             self.setDirty(key) # only propagate the dirty key at the very beginning of the chain
         self.operator.setInSlot(self,key,value)
         
-    @property
-    def graph(self):
-        return self.operator.graph
-
     def dumpToH5G(self, h5g, patchBoard):
         h5g.dumpSubObjects({
             "name" : self.name,
@@ -816,10 +832,7 @@ class InputSlot(object):
             "operator" : self.operator,
             "partner" : self.partner,
             "value" : self._value,
-            "_stype" : self._stype,
-            "dtype" : self.dtype,
-            "axistags" : self.axistags,
-            "shape" : self.shape
+            "stype" : self.stype
             
         },patchBoard)
     
@@ -836,16 +849,13 @@ class InputSlot(object):
             "operator" : "operator",
             "partner" : "partner",
             "value" : "_value",
-            "_stype" : "_stype",
-            "dtype" : "dtype",
-            "axistags" : "axistags",
-            "shape" : "shape"
+            "stype" : "stype"
             
         },patchBoard)
 
         return s
     
-class OutputSlot(object):
+class OutputSlot(Slot):
     """
     The base class for output slots, it provides methods
     to connect the OutputSlot to an InputSlot of another
@@ -857,78 +867,68 @@ class OutputSlot(object):
     
     outputslot[3,:,14:32]
     
-    this call returns an GetItemWriterObject.
+    this call returns an GetItemRequestObject.
     """    
     
     __slots__ = ["name", "_metaParent", "level", "operator",
-                 "dtype", "shape", "axistags", "partners", "_stype",
+                 "dtype", "shape", "axistags", "partners", "stype", "rtype",
                  "_dirtyCallbacks"]    
     
-    def __init__(self, name, operator = None, stype = "ndarray"):
+    def __init__(self, name, operator = None, stype = ArrayLike, rtype = rtype.SubRegion):
+        super(OutputSlot, self).__init__(stype=stype, rtype=rtype)
         self.name = name
         self._metaParent = operator
         self.level = 0
         self.operator = operator
-        if not hasattr(self, "dtype"):
-            self.dtype = None
-        if not hasattr(self, "shape"):
-            self.shape = None
-        if not hasattr(self, "axistags"):
-            self.axistags = None
         self.partners = []
-        self._stype = stype
-        
+
         self._dirtyCallbacks = []
     
+    @property
+    def shape(self):
+      return self.meta.shape
+
+    @property
+    def dtype(self):
+      return self.meta.dtype
+
+    @property
+    def axistags(self):
+      return self.meta.axistags
+
     @property
     def _shape(self):
         return self.shape
         
     @_shape.setter
-    def _shape(self, value):
-        if value is not None:
-            if value != self.shape:
-                self.shape = value
-                for p in self.partners:
-                    #p._checkNotifyConnectAll()
-                    #p.disconnect()
-                    #p.connect(self)
-                    p.shape = value
-                    p.operator._notifyConnect(p)
-                    p._checkNotifyConnectAll()
-            #else:
-            #    self.setDirty(slice(None,None,None)) #set everything to dirty! BEWARE; DANGER;
-        else:
-            self.shape = None
-            #for p in self.partners:
-                #p.operator.notifyConnect(p)
-                #p._checkNotifyConnectAll()
-    
+    def _shape(self,value):
+      old = self.meta.shape
+      self.meta.shape = value
+
     @property
     def _axistags(self):
-        return self.axistags
+      return self.axistags
         
     @_axistags.setter
     def _axistags(self, value):
-        if value is not None:
-            if value != self.axistags:
-                self.axistags = value
-                for p in self.partners:
-                    p.axistags = value
-                    # check for connect propagation 
-                    #p.operator.notifyConnect(p)
-                    #p._checkNotifyConnectAll()                    
-        else:
-            self.axistags = None
+      old = self.meta.axistags
+      self.meta.axistags = value
 
     @property
     def _dtype(self):
-        return self.dtype
+      return self.dtype
 
     @_dtype.setter
     def _dtype(self, value):
-        self.dtype = value
-                
+      old = self.meta.dtype
+      self.meta.dtype = value
+
+    def _changed(self):
+      if self.meta._dirty:
+        for p in self.partners:
+          p._changed()
+
+
     def _connect(self, partner, notify = True):
         if partner not in self.partners:
             self.partners.append(partner)
@@ -980,51 +980,22 @@ class OutputSlot(object):
 
     #FIXME __copy__ ?
     def getInstance(self, operator):
-        s = OutputSlot(self.name, operator, stype = self._stype)
-        s.shape = self.shape
-        s.dtype = self.dtype
-        s.axistags = self.axistags
+        s = OutputSlot(self.name, operator, stype = type(self.stype))
+        s.meta = MetaDict()
         return s
-
-    def _allocateStorage(self, start, stop, axistags = True):
-        storage = numpy.ndarray(stop - start, dtype=self.dtype)
-        if axistags is True:
-            storage = vigra.VigraArray(storage, storage.dtype, axistags = copy.copy(self.axistags))
-            #storage = storage.view(vigra.VigraArray)
-            #storage.axistags = copy.copy(self.axistags)
-        return storage
-
-    def __getitem__(self, key):
-        assert self.shape is not None, "OutputSlot.__getitem__: self.shape=None (operator [self=%r] '%s'" % (self.operator, self.name)
-
-        #start, stop = sliceToRoi(key, self.shape)
-        #assert numpy.min(start) >= 0, "Somebody is requesting shit from slot %s of operator %s (%r)" %(self.name, self.operator.name, self.operator)
-        #assert (stop <= numpy.array(self.shape)).all(), "Somebody is requesting shit from slot %s of operator %s (%r) :  start: %r, stop %r, shape %r" %(self.name, self.operator.name, self.operator, start, stop, self.shape)
-                
-        return GetItemWriterObject(self,key)
     
-    def getOutSlotFromOp(self, key, destination):
-        self.operator.getOutSlot(self, key, destination)
-
-
     def __setitem__(self, key, value):
         for p in self.partners:
             p[key] = value
 
-    @property
-    def graph(self):
-        return self.operator.graph
     
     def dumpToH5G(self, h5g, patchBoard):
         h5g.dumpSubObjects({
             "name" : self.name,
             "level" : self.level,
             "operator" : self.operator,
-            "shape" : self.shape,
-            "axistags" : self.axistags,
-            "dtype" : self.dtype,
             "partners" : self.partners,
-            "_stype" : self._stype
+            "stype" : self.stype
             
         },patchBoard)
     
@@ -1039,18 +1010,15 @@ class OutputSlot(object):
             "name" : "name",
             "level" : "level",
             "operator" : "operator",
-            "shape" : "shape",
-            "axistags" : "axistags",
-            "dtype" : "dtype",
             "partners" : "partners",
-            "_stype" : "_stype"
+            "stype" : "stype"
             
         },patchBoard)
             
         return s
         
 
-class MultiInputSlot(object):
+class MultiInputSlot(Slot):
     """
     The MultiInputSlot is a multidimensional InputSlot.
     
@@ -1058,15 +1026,15 @@ class MultiInputSlot(object):
     """
     
     __slots__ = ["name", "operator", "partner", "inputSlots", "level",
-                 "_stype", "_value"]    
+                 "stype", "rtype", "_value","meta"]    
     
-    def __init__(self, name, operator = None, stype = "ndarray", level = 1):
+    def __init__(self, name, operator = None, stype = ArrayLike, rtype=rtype.SubRegion, level = 1):
+        super(MultiInputSlot, self).__init__(stype=stype, rtype=rtype)
         self.name = name
         self.operator = operator
         self.partner = None
         self.inputSlots = []
         self.level = level
-        self._stype = stype
         self._value = None
     
     @property
@@ -1122,9 +1090,9 @@ class MultiInputSlot(object):
                     
     def _appendNew(self, notify = True, event = None, connect = True):
         if self.level <= 1:
-            islot = InputSlot(self.name ,self, stype = self._stype)
+            islot = InputSlot(self.name ,self, stype = type(self.stype))
         else:
-            islot = MultiInputSlot(self.name,self, stype = self._stype, level = self.level - 1)
+            islot = MultiInputSlot(self.name,self, stype = type(self.stype), level = self.level - 1)
         self.inputSlots.append(islot)
         islot.name = self.name
         index = len(self)-1
@@ -1137,9 +1105,9 @@ class MultiInputSlot(object):
 
     def _insertNew(self, index, notify = True, connect = True):
         if self.level == 1:
-            islot = InputSlot(self.name,self, self._stype)
+            islot = InputSlot(self.name,self, stype = type(self.stype))
         else:
-            islot = MultiInputSlot(self.name,self, stype = self._stype, level = self.level - 1)
+            islot = MultiInputSlot(self.name,self, stype = type(self.stype), level = self.level - 1)
         self.inputSlots.insert(index,islot)
         islot.name = self.name
         if notify:
@@ -1160,7 +1128,7 @@ class MultiInputSlot(object):
                     allConnected = False
                     break
             if allConnected:
-                self.operator._notifyConnectAll()
+              self.operator._setupOutputs()
         else: #the .operator is a MultiInputSlot itself
             self.operator._checkNotifyConnectAll()
         
@@ -1188,7 +1156,11 @@ class MultiInputSlot(object):
             return 1
         else:
             return 0
-
+    
+    def _changed(self):
+      if self.operator:
+        self.operator._notifyConnect(self)
+      self._checkNotifyConnectAll()
         
     def connect(self,partner, notify = True):
         if partner is None:
@@ -1207,6 +1179,7 @@ class MultiInputSlot(object):
                 if self.partner is not None:
                     self.partner.disconnectSlot(self)
                 self.partner = partner
+                self.meta = self.partner.meta.copy()
                 partner._connect(self)
                 # do a type check
                 self.connectOk(self.partner)
@@ -1227,6 +1200,7 @@ class MultiInputSlot(object):
                 #if self.partner is not None:
                 #    self.partner.disconnectSlot(self)                
                 self.partner = partner
+                self.meta = self.partner.meta.copy()
                 for i, slot in enumerate(self):                
                     slot.connect(partner)
                     if self.operator is not None:
@@ -1319,7 +1293,7 @@ class MultiInputSlot(object):
     #TODO RENAME? createInstance
     # def __copy__ ?
     def getInstance(self, operator):
-        s = MultiInputSlot(self.name, operator, stype = self._stype, level = self.level)
+        s = MultiInputSlot(self.name, operator, stype = type(self.stype), level = self.level)
         return s
             
     def setDirty(self, key = None):
@@ -1352,7 +1326,7 @@ class MultiInputSlot(object):
             "level" : self.level,
             "operator" : self.operator,
             "partner" : self.partner,
-            "_stype" : self._stype,
+            "stype" : self.stype,
             "inputSlots": self.inputSlots
             
         },patchBoard)
@@ -1369,7 +1343,7 @@ class MultiInputSlot(object):
             "level" : "level",
             "operator" : "operator",
             "partner" : "partner",
-            "_stype" : "_stype",
+            "stype" : "stype",
             "inputSlots": "inputSlots"
             
         },patchBoard)
@@ -1377,7 +1351,7 @@ class MultiInputSlot(object):
         return s
 
 
-class MultiOutputSlot(object):
+class MultiOutputSlot(Slot):
     """
     The MultiOutputSlot is a multidimensional OutputSlot.
     
@@ -1385,16 +1359,16 @@ class MultiOutputSlot(object):
     """
     
     __slots__ = ["name", "operator", "_metaParent",
-                 "partners", "outputSlots", "level", "_stype"]
+                 "partners", "outputSlots", "level", "stype", "rtype", "meta"]
     
-    def __init__(self, name, operator = None, stype = "ndarray",level = 1):
+    def __init__(self, name, operator = None, stype = ArrayLike, rtype=rtype.SubRegion, level = 1):
+        super(MultiOutputSlot, self).__init__(stype=stype, rtype=rtype)
         self.name = name
         self.operator = operator
         self._metaParent = operator
         self.partners = []   
         self.outputSlots = []
         self.level = level
-        self._stype = stype
     
     def __getitem__(self, key):
         return self.outputSlots[key]
@@ -1422,7 +1396,7 @@ class MultiOutputSlot(object):
             outputSlot._connect(p.inputSlots[index])
     
     def _insertNew(self,index, event = None):
-        oslot = OutputSlot(self.name,self,stype=self._stype)
+        oslot = OutputSlot(self.name,self,stype=type(self.stype))
         self.insert(index,oslot, event = event)
 
 
@@ -1445,7 +1419,12 @@ class MultiOutputSlot(object):
         
         oslot.disconnect()
         oslot = self.outputSlots.pop(index)
-        
+    
+    def _changed(self):
+      if self.meta._dirty:
+        for p in self.partners:
+          p._changed()
+
     def _connect(self, partner, notify = True):
         if partner not in self.partners:
             self.partners.append(partner)
@@ -1470,9 +1449,9 @@ class MultiOutputSlot(object):
     def resize(self, size, event = None):
         while len(self) < size:
             if self.level == 1:
-                slot = OutputSlot(self.name,self, stype = self._stype)
+                slot = OutputSlot(self.name,self, stype = type(self.stype))
             else:
-                slot = MultiOutputSlot(self.name,self, stype = self._stype, level = self.level - 1)
+                slot = MultiOutputSlot(self.name,self, stype = type(self.stype), level = self.level - 1)
             index = len(self)
             self.outputSlots.append(slot)
 
@@ -1484,7 +1463,12 @@ class MultiOutputSlot(object):
             p.resize(size, event = event)
             assert len(p) == len(self)
                 
-            
+    def _execute(self,slot,roi,result):
+        index = self.outputSlots.index(slot)
+        key = roiToSlice(roi.start,roi.stop)
+        return self.operator.getSubOutSlot((self, slot,),(index,),key, result)
+
+
     def getOutSlot(self, slot, key, result):
         index = self.outputSlots.index(slot)
         return self.operator.getSubOutSlot((self, slot,),(index,),key, result)
@@ -1500,22 +1484,18 @@ class MultiOutputSlot(object):
     #TODO RENAME? createInstance
     # def __copy__ ?
     def getInstance(self, operator):
-        s = MultiOutputSlot(self.name, operator, stype = self._stype, level = self.level)
+        s = MultiOutputSlot(self.name, operator, stype = type(self.stype), level = self.level)
         return s
             
-    def setDirty(self, key):
+    def setDirty(self, roi):
         for partner in self.partners:
-            partner.setDirty(key)
+            partner.setDirty(roi)
     
     def connectOk(self, partner):
         # reimplement this method
         # if you want a more involved
         # type checking
         return True
-
-    def getOutSlotFromOp(self, slot, key, destination):
-        index = self.outputSlots.index(slot)
-        self.operator.getSubOutSlot(self, slot, index, key, destination)
 
     @property
     def graph(self):
@@ -1528,7 +1508,7 @@ class MultiOutputSlot(object):
             "level" : self.level,
             "operator" : self.operator,
             "partners" : self.partners,
-            "_stype" : self._stype,
+            "stype" : self.stype,
             "outputSlots" : self.outputSlots
             
         },patchBoard)
@@ -1545,7 +1525,7 @@ class MultiOutputSlot(object):
             "level" : "level",
             "operator" : "operator",
             "partners" : "partners",
-            "_stype" : "_stype",
+            "stype" : "stype",
             "outputSlots" : "outputSlots"
             
         },patchBoard)
@@ -1736,7 +1716,8 @@ class Operator(object):
         self.notifyConnect(inputSlot)
     
     def _notifyConnectAll(self):
-        self.notifyConnectAll()
+        pass
+        #self.notifyConnectAll()
 
     def _notifySubConnect(self, slots, indexes):
         self.notifySubConnect(slots,indexes)
@@ -1759,7 +1740,35 @@ class Operator(object):
             print "                  available inputSlots are: ", self.inputs.keys()
             assert(1==2)
 
+
+    def _setupOutputs(self):
+      self.setupOutputs()
+
+      #notify outputs of probably changed meta informatio
+      for k,v in self.outputs.items():
+        v._changed()
+
+    def setupOutputs(self):
+      """
+      This method is called when all input slots of an operator are
+      successfully connected, a successful connection is also established
+      if the input slot is not connected to another slot, but has
+      a default value defined.
+
+      In this method the operator developer should stup 
+      the .meta information of the outputslots.
+
+      The default implementation emulates the old api behaviour.
+      """
+      # emulate old behaviour
+      for s in self.inputs:
+        self.notifyConnect(s)
+      self.notifyConnectAll()
+
+
+
     """
+    OBSOLETE API
     This method is called opon connection of an inputslot.
     The slot is specified in the inputSlot argument.
     
@@ -1773,6 +1782,7 @@ class Operator(object):
         pass
     
     """
+    OBSOLETE API
     This method is called opon connection of all inputslots of
     an operator.
     
@@ -1826,6 +1836,17 @@ class Operator(object):
 
     def notifySubSlotResize(self,slots,indexes,size,event):
       pass
+
+
+    def _execute(self, slot, roi, result):
+      if hasattr(self, "execute"):
+        self.execute(slot,roi,result)
+      else:
+        #FALLBACK use old  api
+        pslice = roiToSlice(roi.start,roi.stop)
+        warn_deprecated( "getOutSlot() is superseded by execute()" )
+        self.getOutSlot(slot,pslice,result)
+
 
     """
     This method of the operator is called when a connected operator
@@ -1973,18 +1994,18 @@ class OperatorWrapper(Operator):
             # replicate input slot definitions
             for islot in self.operator.inputSlots:
                 level = islot.level + 1
-                self._inputSlots.append(MultiInputSlot(islot.name, stype = islot._stype, level = level))
+                self._inputSlots.append(MultiInputSlot(islot.name, stype = type(islot.stype), level = level))
     
             # replicate output slot definitions
             for oslot in self.outputSlots:
                 level = oslot.level + 1
-                self._outputSlots.append(MultiOutputSlot(oslot.name, stype = oslot._stype, level = level))
+                self._outputSlots.append(MultiOutputSlot(oslot.name, stype = type(oslot.stype), level = level))
     
                     
             # replicate input slots for the instance
             for islot in self.operator.inputs.values():
                 level = islot.level + 1
-                ii = MultiInputSlot(islot.name, self, stype = islot._stype, level = level)
+                ii = MultiInputSlot(islot.name, self, stype = type(islot.stype), level = level)
                 self.inputs[islot.name] = ii
                 setattr(self,islot.name,ii)
                 op = self.operator
@@ -1995,7 +2016,7 @@ class OperatorWrapper(Operator):
             # replicate output slots for the instance
             for oslot in self.operator.outputs.values():
                 level = oslot.level + 1
-                oo = MultiOutputSlot(oslot.name, self, stype = oslot._stype, level = level)
+                oo = MultiOutputSlot(oslot.name, self, stype = type(oslot.stype), level = level)
                 self.outputs[oslot.name] = oo
                 setattr(self,oslot.name,oo)
                 op = self.operator
