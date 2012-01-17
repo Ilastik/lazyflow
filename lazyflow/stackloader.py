@@ -40,149 +40,10 @@ from lazyflow.operators.vigraOperators import *
 from PyQt4 import QtCore, QtGui
 from shutil import rmtree
 
+
 #*******************************************************************************
-# S t a c k L o a d e r                                                        *
+# O p S t a c k C h a i n B u i l d e r                                                        *
 #*******************************************************************************
-
-class StackLoader(QtGui.QDialog):
-    def __init__(self, parent=None):
-        QtGui.QWidget.__init__(self, parent)
-        self.setWindowTitle("Load File Stack")
-        self.setMinimumWidth(400)
-        self.layout = QtGui.QVBoxLayout()
-        self.setLayout(self.layout)
-        
-        #a list of filenames
-        #internally, it's a list of lists of filenames
-        #for each channel
-        self.fileList = []
-        self.channelIDs = []
-        self.options = loadOptionsMgr.loadOptions()
-
-        tempLayout = QtGui.QHBoxLayout()
-        self.path = QtGui.QLineEdit("")
-        self.connect(self.path, QtCore.SIGNAL("textChanged(QString)"), self.pathChanged)
-        self.pathButton = QtGui.QPushButton("Select")
-        self.connect(self.pathButton, QtCore.SIGNAL('clicked()'), self.slotDir)
-        tempLayout.addWidget(self.path)
-        tempLayout.addWidget(self.pathButton)
-        self.layout.addWidget(QtGui.QLabel("Path to Image Stack:"))
-        self.layout.addLayout(tempLayout)
-
-        tempLayout = QtGui.QHBoxLayout()
-        self.multiChannel = QtGui.QCheckBox("Load MultiChannel data from separate channel images:")
-        self.connect(self.multiChannel, QtCore.SIGNAL("stateChanged(int)"), self.toggleMultiChannel)
-        tempLayout.addWidget(self.multiChannel)
-        self.layout.addLayout(tempLayout) 
-        
-        self.multiChannelFrame = QtGui.QFrame()
-        tempLayout = QtGui.QFormLayout()
-        self.addChannelButton = QtGui.QPushButton("  Add channel identifier")
-        self.connect(self.addChannelButton, QtCore.SIGNAL('clicked()'), self.slotAddChannel)
-        tempLayout.addRow(QtGui.QLabel(" "), self.addChannelButton)
-        
-        self.multiChannelFrame.setLayout(tempLayout)
-        
-        self.multiChannelFrame.setVisible(False)
-        self.layout.addWidget(self.multiChannelFrame)        
-
-        tempLayout = QtGui.QHBoxLayout()
-        self.optionsWidget = loadOptionsWidget.LoadOptionsWidget()
-        tempLayout.addWidget(self.optionsWidget)
-        self.layout.addLayout(tempLayout)
-
-        tempLayout = QtGui.QHBoxLayout()
-        self.loadButton = QtGui.QPushButton("Load")
-        self.connect(self.loadButton, QtCore.SIGNAL('clicked()'), self.slotLoad)
-        self.cancelButton = QtGui.QPushButton("Cancel")
-        self.connect(self.cancelButton, QtCore.SIGNAL('clicked()'), self.reject)
-        self.previewFilesButton = QtGui.QPushButton("Preview files")
-        self.connect(self.previewFilesButton, QtCore.SIGNAL('clicked()'), self.slotPreviewFiles)
-        tempLayout.addWidget(self.previewFilesButton)
-        tempLayout.addStretch()
-        tempLayout.addWidget(self.cancelButton)
-        tempLayout.addWidget(self.loadButton)
-        self.layout.addStretch()
-        self.layout.addLayout(tempLayout)
-                
-        self.logger = QtGui.QPlainTextEdit()
-        self.logger.setVisible(False)
-        self.layout.addWidget(self.logger)        
-        self.image = None
-
-    def toggleMultiChannel(self, int):
-        if self.multiChannel.checkState() == 0:
-            self.multiChannelFrame.setVisible(False)
-        else:
-            self.multiChannelFrame.setVisible(True)
-            if len(self.channelIDs)==0:
-                self.slotAddChannel()
-    
-    def slotAddChannel(self):
-        newID = QtGui.QLineEdit()
-        newID.setToolTip("Enter identifier for this channel's files, e.g. GFP or ch01")
-        self.channelIDs.append(newID)
-        nch = len(self.channelIDs)
-        label = "Channel %d identifier" % nch
-        receiver = lambda callingChannel=nch-1: self.channelIDChanged(callingChannel)
-        self.connect(self.channelIDs[nch-1], QtCore.SIGNAL('editingFinished()'), receiver)
-        
-        self.multiChannelFrame.layout().addRow(QtGui.QLabel(label), newID)
-        if len(self.channelIDs)>1:
-            self.fileList.append([])
-
-    def channelIDChanged(self, channel):
-        #if one identifier changes, we only have to change that filelist
-        if len(self.fileList)<channel+1:
-            print "!!! something went wrong with allocating enough lists for channels !!!"
-            return
-        temp = os.path.splitext(str(self.path.text()))[0]
-        chfiles = temp + "*" + str(self.channelIDs[channel].text()) + "*"
-        self.fileList[channel] = sorted(glob.glob(chfiles), key=str.lower)
-        self.optionsWidget.setShapeInfo(self.fileList, self.options.channels)
-
-    def pathChanged(self, text):
-        #if path changes, we have to redo all lookups for all channels
-        self.fileList = []
-        self.options.channels = []
-        if self.multiChannel.checkState() == 0:
-            pathone = str(self.path.text())
-            self.fileList.append(sorted(glob.glob(pathone), key=str.lower))
-            #self.fileList.append(glob.glob(str(self.path.text())))
-            self.options.channels.append(0)
-        else:
-            nch = len(self.channelIDs)
-            temp = os.path.splitext(str(self.path.text()))[0]
-            for ich in range(nch):
-                chfiles = temp + "*" + str(self.channelIDs[ich].text()) + "*"
-                self.fileList[ich] = sorted(glob.glob(chfiles), key=str.lower)
-                self.options.channels.append(ich)                
-        self.optionsWidget.setShapeInfo(self.fileList, self.options.channels)
-
-    def slotDir(self):
-        path = ilastik.gui.LAST_DIRECTORY
-        filename = QtGui.QFileDialog.getExistingDirectory(self, "Image Stack Directory", path)
-        ilastik.gui.LAST_DIRECTORY = QtCore.QFileInfo(filename).path()
-        tempname = filename + "/*"
-        #This is needed, because internally Qt always uses "/" separators,
-        #which is a problem on Windows, as we don't use QDir to open dirs
-        self.path.setText(str(QtCore.QDir.convertSeparators(tempname)))
-        
-
-    def slotPreviewFiles(self):
-        self.fileTableWidget = loadOptionsWidget.previewTable(self.fileList)
-        self.fileTableWidget.exec_()
-
-    def slotLoad(self):    
-        self.optionsWidget.fillOptions(self.options)
-        self.accept()
-
-            
-    def exec_(self):
-        if QtGui.QDialog.exec_(self) == QtGui.QDialog.Accepted:
-            return  str(self.path.text()), self.fileList, self.options
-        else:
-            return None, None, None
 
 
 class OpStackChainBuilder(OperatorGroup):
@@ -200,7 +61,7 @@ class OpStackChainBuilder(OperatorGroup):
     def notifyConnectAll(self):
         
         #FIXME: get a system into the outslot setups. not complete or systematical.
-                
+        
         self.Loader.inputs["globstring"].setValue(self.inputs["globstring"].value)
         
         if self.inputs["invert"].value and not self.inputs["convert"].value:
@@ -232,10 +93,6 @@ class OpStackChainBuilder(OperatorGroup):
             self.outputs["output"]._dtype = self.Loader.outputs["stack"]._dtype
             self.outputs["output"]._axistags = self.Loader.outputs["stack"]._axistags
             self.outputs["output"]._shape = self.Loader.outputs["stack"]._shape
-
-        
-        
-
     def getOutSlot(self, slot, key, result):
         
         if slot.name == "output":
@@ -254,8 +111,115 @@ class OpStackChainBuilder(OperatorGroup):
         outputs["output"] = self.OutPiper.outputs["Output"]
         return outputs
 
-       
+
+#*******************************************************************************
+# S t a c k L o a d e r                                                        *
+#*******************************************************************************
+
+class StackLoader(QtGui.QDialog):
+    def __init__(self, parent=None, graph = Graph()):
+        
+        
+        #SETUP OpStackChainBuilder
+        self.graph = graph
+        self.ChainBuilder = OpStackChainBuilder(self.graph) 
+        #set default for inputslots, because only the notifyConnectAll method is
+        #overridden, so all inputslots have to be set to setup the OperatorGroup
+        #correctly
+        self.ChainBuilder.inputs["invert"].setValue(False)
+        self.ChainBuilder.inputs["convert"].setValue(False)
+        
+        #SETUP LAYOUT
+        #***********************************************************************
+        QtGui.QWidget.__init__(self, parent)
+        self.setWindowTitle("Load File Stack")
+        self.setMinimumWidth(400)
+        self.layout = QtGui.QVBoxLayout()
+        self.setLayout(self.layout)
+        
+        #a list of filenames
+        #internally, it's a list of lists of filenames
+        #for each channel
+        
+        tempLayout = QtGui.QHBoxLayout()
+        self.path = QtGui.QLineEdit("")
+        self.connect(self.path, QtCore.SIGNAL("textChanged(QString)"), self.pathChanged)
+        self.pathButton = QtGui.QPushButton("Select")
+        self.connect(self.pathButton, QtCore.SIGNAL('clicked()'), self.slotDir)
+        tempLayout.addWidget(self.path)
+        tempLayout.addWidget(self.pathButton)
+        self.layout.addWidget(QtGui.QLabel("Path to Image Stack:"))
+        self.layout.addLayout(tempLayout)
+
+        #SETUP CheckBoxes
+        
+        tempLayout = QtGui.QVBoxLayout()
+        self.invertCheckBox = QtGui.QCheckBox("Invert Colors")
+        self.connect(self.invertCheckBox, QtCore.SIGNAL('stateChanged(int)'),self.checkBoxesChanged)
+        self.convertCheckBox = QtGui.QCheckBox("Convert To GrayScale")
+        self.connect(self.convertCheckBox, QtCore.SIGNAL('stateChanged(int)'),self.checkBoxesChanged)
+        tempLayout.addWidget(self.invertCheckBox)
+        tempLayout.addWidget(self.convertCheckBox)
+        self.layout.addLayout(tempLayout)
+
+        tempLayout = QtGui.QHBoxLayout()
+        self.loadButton = QtGui.QPushButton("Load")
+        self.connect(self.loadButton, QtCore.SIGNAL('clicked()'), self.slotLoad)
+        self.cancelButton = QtGui.QPushButton("Cancel")
+        self.connect(self.cancelButton, QtCore.SIGNAL('clicked()'), self.reject)
+        self.previewFilesButton = QtGui.QPushButton("Preview files")
+        self.connect(self.previewFilesButton, QtCore.SIGNAL('clicked()'), self.slotPreviewFiles)
+        tempLayout.addWidget(self.previewFilesButton)
+        tempLayout.addStretch()
+        tempLayout.addWidget(self.cancelButton)
+        tempLayout.addWidget(self.loadButton)
+        self.layout.addStretch()
+        self.layout.addLayout(tempLayout)
+
+        self.image = None
+
+    def pathChanged(self, text):
+        print 'path Changed to', text
+        self.ChainBuilder.inputs["globstring"].setValue(str(text))
     
+    def checkBoxesChanged(self,integer):
+        if self.invertCheckBox.checkState() and not self.convertCheckBox.checkState() :
+            self.ChainBuilder.inputs["invert"].setValue(True)
+            self.ChainBuilder.inputs["convert"].setValue(False)
+        elif not self.invertCheckBox.checkState() and self.convertCheckBox.checkState() :
+            self.ChainBuilder.inputs["invert"].setValue(False)
+            self.ChainBuilder.inputs["convert"].setValue(True)
+        elif self.invertCheckBox.checkState() and self.convertCheckBox.checkState() :
+            self.ChainBuilder.inputs["invert"].setValue(True)
+            self.ChainBuilder.inputs["convert"].setValue(True)
+        else:
+            self.ChainBuilder.inputs["invert"].setValue(False)
+            self.ChainBuilder.inputs["convert"].setValue(False)
+
+    def slotDir(self):
+        path = ilastik.gui.LAST_DIRECTORY
+        filename = QtGui.QFileDialog.getExistingDirectory(self, "Image Stack Directory", path)
+        ilastik.gui.LAST_DIRECTORY = QtCore.QFileInfo(filename).path()
+        tempname = filename + '/*.png'
+        #This is needed, because internally Qt always uses "/" separators,
+        #which is a problem on Windows, as we don't use QDir to open dirs
+        self.path.setText(str(QtCore.QDir.convertSeparators(tempname)))
+        
+
+    def slotPreviewFiles(self):
+        self.fileTableWidget = loadOptionsWidget.previewTable(self.fileList)
+        self.fileTableWidget.exec_()
+
+    def slotLoad(self):    
+        result = self.ChainBuilder.outputs["output"][:].allocate().wait()
+        print result.shape
+            
+    def exec_(self):
+        if QtGui.QDialog.exec_(self) == QtGui.QDialog.Accepted:
+            return  str(self.path.text()), self.fileList, self.options
+        else:
+            return None, None, None
+
 class TestOperatorChain():
     
     def __init__(self,testdirectory='./testImages/',imagedimension = (200,200,50,3),configuration = (False,False)):
@@ -340,7 +304,7 @@ class TestOperatorChain():
         if self.config[0] == False  and self.config[1] == True:
             for i in range(result.shape[-1]):
                 assert(result[:,:,:,i] == (numpy.round(0.299*self.block[:,:,:,0] + 0.587*self.block[:,:,:,1] + 0.114*self.block[:,:,:,2])).astype(int)).all()
-        
+                
         #config(True,True) - Inv, Conv
         if self.config[0] == True  and self.config[1] == True:
             for i in range(self.block.shape[-1]):
@@ -357,12 +321,28 @@ class TestOperatorChain():
 #*******************************************************************************
 # i f   _ _ n a m e _ _   = =   " _ _ m a i n _ _ "                            *
 #*******************************************************************************
-
 if __name__ == "__main__":
     
+    
+    
     # configuration=(intert?[True/False],converttoGrayscale?[True/False])
-    testclass = TestOperatorChain(configuration=(True,True))
-    testclass.stackAndTestConfig()
+    if '-test' in sys.argv:
+        testclass = TestOperatorChain(configuration=(True,True))
+        testclass.stackAndTestConfig()
+        testclass = TestOperatorChain(configuration=(False,True))
+        testclass.stackAndTestConfig()
+        testclass = TestOperatorChain(configuration=(True,False))
+        testclass.stackAndTestConfig()
+        testclass = TestOperatorChain(configuration=(False,False))
+        testclass.stackAndTestConfig()
+
+    if '-gui' in sys.argv:
+        app = QtGui.QApplication([""])
+        dialog = StackLoader()
+        print dialog.show()
+        app.exec_()
+
+
 
 
 
