@@ -2,7 +2,7 @@ import numpy, vigra, h5py
 import traceback
 from lazyflow.graph import *
 import gc
-from lazyflow import roi
+from lazyflow.roi import roiToSlice,sliceToRoi,extendSlice,TinyVector
 import copy
 
 from operators import OpArrayPiper, OpMultiArrayPiper
@@ -377,7 +377,7 @@ class OpPixelFeaturesPresmoothed(OperatorGroup):
         if slot == self.outputs["Output"]:
             cnt = 0
             written = 0
-            start, stop = roi.sliceToRoi(key, self.outputs["Output"]._shape)
+            start, stop = sliceToRoi(key, self.outputs["Output"]._shape)
             assert (stop<=self.outputs["Output"].shape).all()
             flag = 'c'
             __channelAxis=self.inputs["Input"].axistags.index('c')
@@ -410,19 +410,19 @@ class OpPixelFeaturesPresmoothed(OperatorGroup):
             __subshape=popFlagsFromTheKey(__subshape,__at2,'t')
             __subkey = popFlagsFromTheKey(__subkey,__at2,'t')
             
-            __oldstart, __oldstop = roi.sliceToRoi(key, __shape)
+            __oldstart, __oldstop = sliceToRoi(key, __shape)
             
-            __start, __stop = roi.sliceToRoi(__subkey,__subkey)
+            __start, __stop = sliceToRoi(__subkey,__subkey)
             __maxSigma = max(0.7,self.maxSigma)
         
-            __newStart, __newStop = roi.extendSlice(__start, __stop, __subshape, __maxSigma, window = 3.5)
+            __newStart, __newStop = extendSlice(__start, __stop, __subshape, __maxSigma, window = 3.5)
             
-            __vigOpSourceStart, __vigOpSourceStop = roi.extendSlice(__start, __stop, __subshape, 0.7, window = 2)
+            __vigOpSourceStart, __vigOpSourceStop = extendSlice(__start, __stop, __subshape, 0.7, window = 2)
             
-            __vigOpSourceStart = roi.TinyVector(__vigOpSourceStart - __newStart)
-            __vigOpSourceStop = roi.TinyVector(__vigOpSourceStop - __newStart)
+            __vigOpSourceStart = TinyVector(__vigOpSourceStart - __newStart)
+            __vigOpSourceStop = TinyVector(__vigOpSourceStop - __newStart)
             
-            __readKey = roi.roiToSlice(__newStart, __newStop)
+            __readKey = roiToSlice(__newStart, __newStop)
         
         
             __writeNewStart = __start - __newStart
@@ -620,11 +620,11 @@ class OpBaseVigraFilter(OpArrayPiper):
         subshape=popFlagsFromTheKey(subshape,at2,'t')
         subkey = popFlagsFromTheKey(subkey,at2,'t')
         
-        oldstart, oldstop = roi.sliceToRoi(key, shape)
+        oldstart, oldstop = sliceToRoi(key, shape)
         
-        start, stop = roi.sliceToRoi(subkey,subkey)
-        newStart, newStop = roi.extendSlice(start, stop, subshape, largestSigma, window = windowSize)
-        readKey = roi.roiToSlice(newStart, newStop)
+        start, stop = sliceToRoi(subkey,subkey)
+        newStart, newStop = extendSlice(start, stop, subshape, largestSigma, window = windowSize)
+        readKey = roiToSlice(newStart, newStop)
         
         writeNewStart = start - newStart
         writeNewStop = writeNewStart +  stop - start
@@ -634,7 +634,7 @@ class OpBaseVigraFilter(OpArrayPiper):
         else:
             fullResult = False
         
-        writeKey = roi.roiToSlice(writeNewStart, writeNewStop)
+        writeKey = roiToSlice(writeNewStart, writeNewStop)
         writeKey = list(writeKey)
         if timeAxis < channelAxis:
             writeKey.insert(channelAxis-1, slice(None,None,None))
@@ -1176,7 +1176,7 @@ class OpH5Reader(Operator):
         #f.close()
         
         #Debug DUMPING REQUEST TO FILE
-        #start,stop=roi.sliceToRoi(key,self.d.shape)
+        #start,stop=sliceToRoi(key,self.d.shape)
         #dif=numpy.array(stop)-numpy.array(start)
         
         #self.ff.write(str(start)+'   '+str(stop)+'   ***  '+str(dif)+' \n')
@@ -1260,7 +1260,7 @@ class OpH5Writer(Operator):
           start =  nIndices
           stop = numpy.minimum(nshape,start+nBlockShape)
 
-          s = roi.roiToSlice(start,stop)
+          s = roiToSlice(start,stop)
           req = self.inputs["Image"][s].allocate()
           
           req.notify(writeResult,blockNr = bnr, roiSlice=s)

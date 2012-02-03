@@ -1,5 +1,6 @@
 from lazyflow.graph import *
-from lazyflow import roi 
+from lazyflow.roi import roiToSlice, sliceToRoi, extendSlice
+
 
 
 def axisTagObjectFromFlag(flag):
@@ -100,7 +101,7 @@ class OpMultiArraySlicer(Operator):
         
         #print "SLICER: key", key, "indexes[0]", indexes[0], "result", result.shape
         
-        start,stop=roi.sliceToRoi(key,self.outputs["Slices"][indexes[0]].shape)
+        start,stop=sliceToRoi(key,self.outputs["Slices"][indexes[0]].shape)
         
         oldstart,oldstop=start,stop
         
@@ -113,7 +114,7 @@ class OpMultiArraySlicer(Operator):
         start.insert(indexAxis,indexes[0])
         stop.insert(indexAxis,indexes[0])
         
-        newKey=roi.roiToSlice(numpy.array(start),numpy.array(stop))
+        newKey=roiToSlice(numpy.array(start),numpy.array(stop))
         
         ttt = self.inputs["Input"][newKey].allocate().wait()
         
@@ -165,7 +166,7 @@ class OpMultiArraySlicer2(Operator):
         outshape = self.outputs["Slices"][indexes[0]].shape
             
         
-        start,stop=roi.sliceToRoi(key,outshape)
+        start,stop=sliceToRoi(key,outshape)
         oldstart,oldstop=start,stop
         
         start=list(start)
@@ -181,7 +182,7 @@ class OpMultiArraySlicer2(Operator):
         stop.insert(indexAxis,indexes[0])
         
         
-        newKey=roi.roiToSlice(numpy.array(start),numpy.array(stop))
+        newKey=roiToSlice(numpy.array(start),numpy.array(stop))
       
         ttt = self.inputs["Input"][newKey].allocate().wait()
         result[:]=ttt[:]
@@ -240,7 +241,7 @@ class OpMultiArrayStacker(Operator):
         key = roi.toSlice()
         cnt = 0
         written = 0
-        start, stop = roi.sliceToRoi(key, self.outputs["Output"].shape)
+        start, stop = sliceToRoi(key, self.outputs["Output"].shape)
         assert (stop<=self.outputs["Output"].shape).all()
         axisindex = self.inputs["AxisIndex"].value
         flag = self.inputs["AxisFlag"].value

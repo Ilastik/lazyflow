@@ -2,7 +2,7 @@ import numpy, vigra
 import time
 from lazyflow.graph import *
 import gc
-import lazyflow.roi
+from lazyflow.roi import roiToSlice, sliceToRoi, extendSlice
 import threading
 
 from operators import OpArrayCache, OpArrayPiper, OpMultiArrayPiper
