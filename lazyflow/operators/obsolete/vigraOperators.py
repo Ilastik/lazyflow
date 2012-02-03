@@ -338,6 +338,7 @@ class OpPixelFeaturesPresmoothed(OperatorGroup):
                     val=self.matrix[i,j]
                     if val:
                         self.multi.inputs["Input%02d" %(i*dimRow+j)].connect(oparray[i][j].outputs["Output"])
+                        print "connected  Input%02d of self.multi" %(i*dimRow+j)
             
             #additional connection with FakeOperator
             if (self.matrix==0).all():
@@ -346,7 +347,7 @@ class OpPixelFeaturesPresmoothed(OperatorGroup):
                 fakeOp.inputs["sigma"].setValue(10)
                 self.multi.inputs["Input%02d" %(i*dimRow+j+1)].connect(fakeOp.outputs["Output"])
                 self.multi.inputs["Input%02d" %(i*dimRow+j+1)].disconnect() 
-                self.stacker.outputs["Output"].shape=()
+                self.stacker.outputs["Output"]._shape=()
                 return
          
             
