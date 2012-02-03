@@ -47,7 +47,7 @@ class OpArrayPiper(Operator):
         key = roi.toSlice()
         req = self.inputs["Input"][key].writeInto(result)
         res = req.wait()
-        return res
+        return result
 
     def notifyDirty(self,slot,key):
         self.outputs["Output"].setDirty(key)

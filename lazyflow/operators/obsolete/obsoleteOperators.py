@@ -412,6 +412,7 @@ class OpArraySliceCache(OpArrayPiper):
         else:
             print "SliceCache: queriying graph..."
             dirtyBoxesQuery(self.inputs["Input"], result, start, stop, self.shape, self._blockShapes[dim], self._dirtyIndices[dim], self._dirtyArrays[dim], self._dirtyState, self._cache)
+        return result
 
 
 
@@ -430,4 +431,4 @@ class OpArraySliceCacheBounding(OpArraySliceCache):
         else:
             print "SliceCache: queriying graph..."
             dirtyBoundingBoxQuery(self.inputs["Input"], result, start, stop, self.shape, self._blockShapes[dim], self._dirtyIndices[dim], self._dirtyArrays[dim], self._dirtyState, self._cache)
-      
+        return result
