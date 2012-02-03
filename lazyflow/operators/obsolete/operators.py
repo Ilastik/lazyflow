@@ -37,13 +37,14 @@ class OpArrayPiper(Operator):
     inputSlots = [InputSlot("Input")]
     outputSlots = [OutputSlot("Output")]    
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         inputSlot = self.inputs["Input"]
         self.outputs["Output"]._dtype = inputSlot.dtype
         self.outputs["Output"]._shape = inputSlot.shape
         self.outputs["Output"]._axistags = copy.copy(inputSlot.axistags)
 
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
+        key = roi.toSlice()
         req = self.inputs["Input"][key].writeInto(result)
         res = req.wait()
         return res
@@ -71,7 +72,7 @@ class OpMultiArrayPiper(Operator):
     inputSlots = [MultiInputSlot("MultiInput")]
     outputSlots = [MultiOutputSlot("MultiOutput")]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         inputSlot = self.inputs["MultiInput"]
         
         self.outputs["MultiOutput"].resize(len(inputSlot)) #clearAllSlots()
@@ -91,8 +92,8 @@ class OpMultiArrayPiper(Operator):
     def notifySubSlotResize(self,slots,indexes,size,event):
         self.outputs["MultiOutput"].resize(size,event = event)
 
-    def getOutSlot(self, slot, key, result):
-        raise RuntimeError("OpMultiPipler does not support getOutSlot")
+    def execute(self, slot, roi, result):
+        raise RuntimeError("OpMultiPipler does not support execute")
 
     def getSubOutSlot(self, slots, indexes, key, result):
         req = self.inputs["MultiInput"][indexes[0]][key].writeInto(result)
@@ -115,7 +116,7 @@ class OpMultiMultiArrayPiper(Operator):
     inputSlots = [MultiInputSlot("MultiInput", level = 2)]
     outputSlots = [MultiOutputSlot("MultiOutput", level = 2)]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         inputSlot = self.inputs["MultiInput"]
 
         self.outputs["MultiOutput"].resize(len(inputSlot)) #clearAllSlots()
@@ -128,8 +129,8 @@ class OpMultiMultiArrayPiper(Operator):
                     oslot._shape = islot.shape
                     oslot._axistags = islot.axistags
             
-    def getOutSlot(self, slot, key, result):
-        raise RuntimeError("OpMultiMultiPipler does not support getOutSlot")
+    def execute(self, slot, roi, result):
+        raise RuntimeError("OpMultiMultiPipler does not support execute")
 
     def getSubOutSlot(self, slots, indexes, key, result):
         req = self.inputs["MultiInput"][indexes[0]][indexes[1]][key].writeInto(result)
@@ -177,9 +178,10 @@ class OpRequestSplitter(OpArrayPiper):
     description = "split requests into two parts along longest axis"
     category = "misc"
     
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
+        key = roi.toSlice()
         start, stop = sliceToRoi(key, self.shape)
-        
+
         diff = stop-start
         
         splitDim = numpy.argmax(diff[:-1])
@@ -209,6 +211,7 @@ class OpRequestSplitter(OpArrayPiper):
         req2 = self.inputs["Input"][key2].writeInto(result[writeKey2])
         req1.wait()
         req2.wait()
+        return result
         
 def fastWhere(cond, A, B, dtype):
     nonz = numpy.nonzero(cond)
@@ -326,7 +329,7 @@ class OpArrayCache(OpArrayPiper):
             self._cache = mem
         self._cacheLock.release()
             
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         reconfigure = False
         if  self.inputs["fixAtCurrent"].connected():
             self._fixed =  self.inputs["fixAtCurrent"].value  
@@ -366,8 +369,9 @@ class OpArrayCache(OpArrayPiper):
             if  self.inputs["fixAtCurrent"].connected():
                 self._fixed =  self.inputs["fixAtCurrent"].value   
         
-    def getOutSlot(self,slot,key,result):
+    def execute(self,slot,roi,result):
         #return     
+        key = roi.toSlice()
         self.graph._notifyMemoryHit()
         
         start, stop = sliceToRoi(key, self.shape)
@@ -407,6 +411,7 @@ class OpArrayCache(OpArrayPiper):
         dirtyRois = []
         half = tileArray.shape[0]/2
         dirtyRequests = []
+        return result
 
         def onCancel():
             return False # indicate that this request cannot be canceled
@@ -576,7 +581,7 @@ if has_blist:
             self._oldShape = (0,)
             Operator.__init__(self, graph)
             
-        def notifyConnectAll(self):
+        def setupOutputs(self):
           if (self._oldShape != self.inputs["shape"].value).all():
                 shape = self.inputs["shape"].value
                 self._oldShape = shape
@@ -618,7 +623,8 @@ if has_blist:
                 self.outputs["Output"][:] = self._denseArray #set output dirty
                     
                 
-        def getOutSlot(self, slot, key, result):
+        def execute(self, slot, roi, result):
+            key = roi.toSlice()
             self.lock.acquire()
             assert(self.inputs["eraser"].connected() == True and self.inputs["shape"].connected() == True), "OpDenseSparseArray:  One of the neccessary input slots is not connected: shape: %r, eraser: %r" % (self.inputs["eraser"].connected(), self.inputs["shape"].connected())
             if slot.name == "Output":
@@ -712,7 +718,7 @@ if has_blist:
             #Inner operators are created on demand            
             pass
             
-        def notifyConnectAll(self):
+        def setupOutputs(self):
             for slot in self.inputs.values():
               if slot.connected() is False:
                 continue
@@ -802,7 +808,8 @@ if has_blist:
                       self.outputs["nonzeroCoordinates"][0] = numpy.array(self._sparseNZ.keys())
                       self.outputs["Output"][:] = self._denseArray #set output dirty
                     
-        def getOutSlot(self, slot, key, result):
+        def execute(self, slot, roi, result):
+            key = roi.toSlice()
             self.lock.acquire()
             assert(self.inputs["eraser"].connected() == True and self.inputs["shape"].connected() == True and self.inputs["blockShape"].connected()==True), \
             "OpDenseSparseArray:  One of the neccessary input slots is not connected: shape: %r, eraser: %r" % \
@@ -816,7 +823,7 @@ if has_blist:
                 blockKey = roiToSlice(blockStart,blockStop)
                 innerBlocks = self._blockNumbers[blockKey]
                 if lazyflow.verboseRequests:
-                    print "OpBlockedSparseLabelArray %r: request with key %r for %d inner Blocks " % (self,key, len(innerBlocks.ravel()))    
+                    print "OpBlockedSparseLabelArray %r: request with roi.start,roi.stop %r,%r for %d inner Blocks " % (self,roi.start,roi.stop, len(innerBlocks.ravel()))    
                 for b_ind in innerBlocks.ravel():
                     #which part of the original key does this block fill?
                     offset = self._blockShape*self._flatBlockIndices[b_ind]
@@ -914,7 +921,7 @@ class OpBlockedArrayCache(OperatorGroup):
         self.source = OpArrayPiper(self.graph)
         self.fixerSource = OpArrayPiper(self.graph)
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         self._fixed = self.inputs["fixAtCurrent"].value  
         self.fixerSource.inputs["Input"].setValue(self._fixed)
         self.fixerSource.inputs["Input"].setDirty(0)
@@ -957,12 +964,13 @@ class OpBlockedArrayCache(OperatorGroup):
             self._lock = Lock()
             
 
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
         #return
         
+        key = roi.toSlice()
         #find the block key
         start, stop = sliceToRoi(key, self.shape)
-        
+
         blockStart = (start / self._blockShape)
         blockStop = (stop * 1.0 / self._blockShape).ceil()
         #blockStop = numpy.where(stop == self.shape, self._dirtyShape, blockStop)
@@ -970,8 +978,7 @@ class OpBlockedArrayCache(OperatorGroup):
         innerBlocks = self._blockNumbers[blockKey]
 
         if lazyflow.verboseRequests:
-            print "OpSparseArrayCache %r: request with key %r for %d inner Blocks " % (self,key, len(innerBlocks.ravel()))
-
+            print "OpBlockedSparseLabelArray %r: request with key %r for %d inner Blocks " % (self,key, len(innerBlocks.ravel()))
         
         requests = []
         for b_ind in innerBlocks.flat:
@@ -1013,7 +1020,7 @@ class OpBlockedArrayCache(OperatorGroup):
             if self._cache_list.has_key(b_ind):
                 op = self._cache_list[b_ind]
                 #req = self._cache_list[b_ind].outputs["Output"][smallkey].writeInto(result[bigkey])
-                op.getOutSlot(op.outputs["Output"],smallkey,result[bigkey])
+                op.execute(op.outputs["Output"],smallkey,result[bigkey])
                 #requests.append(req)
             else:
                 #When this block has never been in the cache and the current
@@ -1023,6 +1030,7 @@ class OpBlockedArrayCache(OperatorGroup):
         
         for r in requests:
           r.wait()
+        return result
 
 
     def notifyDirty(self, slot, key):
@@ -1060,7 +1068,7 @@ class OpSlicedBlockedArrayCache(OperatorGroup):
         self.source = OpArrayPiper(self.graph)
         self.fixerSource = OpArrayPiper(self.graph)
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         slot = self.inputs["fixAtCurrent"]
         if slot == self.inputs["fixAtCurrent"]:
             self._fixed = self.inputs["fixAtCurrent"].value  
@@ -1091,7 +1099,8 @@ class OpSlicedBlockedArrayCache(OperatorGroup):
                 self.outputs["Output"]._shape = self.inputs["Input"].shape            
 
             
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
+        key = roi.toSlice()
         start,stop=sliceToRoi(key,self.shape)
         diff=numpy.array(stop)-numpy.array(start)
 
@@ -1111,6 +1120,8 @@ class OpSlicedBlockedArrayCache(OperatorGroup):
         self._lock.release()        
         
         op.outputs["Output"][key].writeInto(result).wait()
+        return result
+        
 
     def notifyDirty(self, slot, key):
         if slot == self.inputs["Input"] and not self._fixed:

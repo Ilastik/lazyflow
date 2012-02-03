@@ -218,7 +218,7 @@ class GetItemRequestObject(object):
           assert(len(self.roi.toSlice()) == self.destination.ndim), "%r ndim=%r, shape=%r" % (self.roi.toSlice(), self.destination.ndim, self.destination.shape)
           ret = self.func(self.arg1,self.roi, self.destination)
           if ret == None:
-              warn_deprecated("Old style operator with no return value in Op.execute() encountered: " + self.func.__self__.__class__.__name__)
+              warn_deprecated("Old style operator with no return value in Op.execute() encountered: " + self.func.__self__.__class__.__name__ +", Operator concerned: " +self.slot.operator.name)
           else:
               self.destination = ret
         except Exception,e:
@@ -1618,7 +1618,7 @@ class Operator(object):
         if hasattr(obj, "getOutSlot"):
             def getOutSlot_wrapper( self, slot, roi, result ):
                 pslice = roiToSlice(roi.start,roi.stop)
-                warn_deprecated( "getOutSlot() is superseded by execute()" )
+                warn_deprecated( "getOutSlot() is superseded by execute(), Operator concerned " + obj.name)
                 return self.getOutSlot(slot,pslice,result)
             obj.execute = types.MethodType(getOutSlot_wrapper, obj)
         return obj

@@ -20,7 +20,7 @@ class OpXToMulti(Operator):
     inputSlots = []
     outputSlots = []
         
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         length = 0
         for slot in self.inputs.values():
             if slot.connected():
@@ -46,6 +46,7 @@ class OpXToMulti(Operator):
                     result[:] = slot[key].allocate().wait()
                     break
                 i += 1                
+        return result
 
     def propagateDirty(self, islot, roi):
         i = 0
@@ -130,7 +131,7 @@ class OpPixelFeatures(OperatorGroup):
         self.stacker.inputs["Images"].connect(self.multi.outputs["Outputs"])
         
         
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         if self.inputs["Scales"].connected() and self.inputs["Matrix"].connected():
 
             self.stacker.inputs["Images"].disconnect()
@@ -254,7 +255,7 @@ class OpPixelFeaturesPresmoothed(OperatorGroup):
         self.stacker.inputs["Images"].connect(self.multi.outputs["Outputs"])
         
         
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         if self.inputs["Scales"].connected() and self.inputs["Matrix"].connected():
 
             self.stacker.inputs["Images"].disconnect()
@@ -370,7 +371,8 @@ class OpPixelFeaturesPresmoothed(OperatorGroup):
             self.outputs["Output"]._axistags = self.stacker.outputs["Output"]._axistags            
             self.outputs["Output"]._shape = self.stacker.outputs["Output"]._shape            
     
-    def getOutSlot(self, slot, key, result):    
+    def execute(self, slot, roi, result):    
+        key = roi.toSlice()
         if slot == self.outputs["Output"]:
             cnt = 0
             written = 0
@@ -521,7 +523,7 @@ class OpPixelFeaturesPresmoothed(OperatorGroup):
                                 reskey[axisindex] = slice(written, written+end-begin, None)
                                 
                                 destArea = result[tuple(reskey)]
-                                oslot.operator.getOutSlot(oslot,tuple(key_),destArea, sourceArray = sourceArraysForSigmas[j])
+                                oslot.operator.execute(oslot,tuple(key_),destArea, sourceArray = sourceArraysForSigmas[j])
                                 written += end - begin
                             cnt += slices
                         else:
@@ -532,7 +534,7 @@ class OpPixelFeaturesPresmoothed(OperatorGroup):
                                 #print "result: ", result.shape, "inslot:", inSlot.shape
                                 
                                 destArea = result[tuple(reskey)]
-                                oslot.operator.getOutSlot(oslot,tuple(oldkey),destArea, sourceArray = sourceArraysForSigmas[j])
+                                oslot.operator.execute(oslot,tuple(oldkey),destArea, sourceArray = sourceArraysForSigmas[j])
                                 written += 1
                             cnt += 1
 
@@ -543,6 +545,7 @@ class OpPixelFeaturesPresmoothed(OperatorGroup):
                         sourceArraysForSigmas[i].resize((1,))
                     except:
                         sourceArraysForSigmas[i] = None
+        return result
 
         
     def getInnerInputs(self):
@@ -578,7 +581,8 @@ class OpBaseVigraFilter(OpArrayPiper):
     def __init__(self, graph, register = True):
         OpArrayPiper.__init__(self, graph, register = register)
         
-    def getOutSlot(self, slot, key, result, sourceArray = None):
+    def execute(self, slot, roi, result, sourceArray = None):
+        key = roi.toSlice()
         kwparams = {}        
         for islot in self.inputs.values():
             if islot.name != "Input":
@@ -756,10 +760,11 @@ class OpBaseVigraFilter(OpArrayPiper):
                         print "EXCEPT3", resultArea.shape,  tresKey, twriteKey
                         print "EXCEPT3", step, t.shape, timeAxis
                         assert 1==2
+        return result
                 
 
             
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         numChannels  = 1
         inputSlot = self.inputs["Input"]
         if inputSlot.axistags.axisTypeCount(vigra.AxisType.Channels) > 0:
@@ -1002,7 +1007,7 @@ class OpImageReader(Operator):
     inputSlots = [InputSlot("Filename", stype = "filestring")]
     outputSlots = [OutputSlot("Image")]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         filename = self.inputs["Filename"].value
 
         if filename is not None:
@@ -1018,12 +1023,13 @@ class OpImageReader(Operator):
             oslot._dtype = None
             oslot._axistags = None
 
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
+        key = roi.toSlice()
         filename = self.inputs["Filename"].value
         temp = vigra.impex.readImage(filename)
 
         result[:] = temp[key]
-        #self.outputs["Image"][:]=temp[:]
+        return result
     
 import glob
 class OpFileGlobList(Operator):
@@ -1033,7 +1039,7 @@ class OpFileGlobList(Operator):
     inputSlots = [InputSlot("Globstring", stype = "string")]
     outputSlots = [MultiOutputSlot("Filenames", stype = "filestring")]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         globstring = self.inputs["Globstring"].value
         
         self.filenames = glob.glob(globstring)        
@@ -1071,9 +1077,11 @@ class OpOstrichReader(Operator):
         oslot._dtype = info.getDtype()
         oslot._axistags = info.getAxisTags()
     
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
+        key = roi.toSlice()
         temp = vigra.impex.readImage(self.filename)
         result[:] = temp[key]
+        return result
 
 
 class OpImageWriter(Operator):
@@ -1082,7 +1090,7 @@ class OpImageWriter(Operator):
     
     inputSlots = [InputSlot("Filename", stype = "filestring" ), InputSlot("Image")]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         filename = self.inputs["Filename"].value
 
         imSlot = self.inputs["Image"]
@@ -1109,7 +1117,7 @@ class OpH5Reader(Operator):
     outputSlots = [OutputSlot("Image")]
     
         
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         filename = self.inputs["Filename"].value
         hdf5Path = self.inputs["hdf5Path"].value
         
@@ -1152,7 +1160,8 @@ class OpH5Reader(Operator):
         #self.ff=open(logfile,'a')
         
         
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
+        key = roi.toSlice()
         filename = self.inputs["Filename"].value
         hdf5Path = self.inputs["hdf5Path"].value
         
@@ -1161,10 +1170,8 @@ class OpH5Reader(Operator):
         #d = f[hdf5Path]
         
         
-        
-        
-        
         result[:] = self.d[key]
+        return result
         #f.close()
         
         #Debug DUMPING REQUEST TO FILE
@@ -1182,7 +1189,7 @@ class OpH5Writer(Operator):
     inputSlots = [InputSlot("Filename", stype = "filestring"), InputSlot("hdf5Path", stype = "string"), InputSlot("Image"), InputSlot("blockShape")]
     outputSlots = [OutputSlot("WriteImage")]
 
-    def notifyConnectAll(self):        
+    def setupOutputs(self):        
         self.outputs["WriteImage"]._shape = (1,)
         self.outputs["WriteImage"]._dtype = object
 #            filename = self.inputs["Filename"][0].allocate().wait()[0]
@@ -1205,7 +1212,7 @@ class OpH5Writer(Operator):
 #    
 #            self.inputs["Image"][:].writeInto(image).notify(closure)
     
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
         filename = self.inputs["Filename"].value
         hdf5Path = self.inputs["hdf5Path"].value
 
@@ -1264,7 +1271,7 @@ class OpH5Writer(Operator):
         f.close()
         
         result[0] = True
-        
+        return result
         
         
 class OpH5WriterBigDataset(Operator):
@@ -1274,7 +1281,7 @@ class OpH5WriterBigDataset(Operator):
     inputSlots = [InputSlot("Filename", stype = "filestring"), InputSlot("hdf5Path", stype = "string"), InputSlot("Image")]
     outputSlots = [OutputSlot("WriteImage")]
 
-    def notifyConnectAll(self):    
+    def setupOutputs(self):    
         self.outputs["WriteImage"]._shape = (1,)
         self.outputs["WriteImage"]._dtype = object
         
@@ -1298,7 +1305,7 @@ class OpH5WriterBigDataset(Operator):
                                 compression='gzip', compression_opts=4)
 
     
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
         
         requests=self.computeRequests()
         
@@ -1316,6 +1323,7 @@ class OpH5WriterBigDataset(Operator):
             self.d[r]=t.wait()
             print "request ", i, "out of ", len(tmp), "executed"
         result[0] = True
+        return result
         
         
     def computeRequests(self):
@@ -1345,21 +1353,11 @@ class OpH5WriterBigDataset(Operator):
                             stop=numpy.minimum(start+shift,shape)
                             reqList.append(roiToSlice(start,stop))
         
-     
-        
-        
-   
         
         return reqList
     
     def close(self):
         self.f.close()
-        
-        
-        
-        
-        
-        
                 
 
 class OpH5ReaderBigDataset(Operator):
@@ -1375,7 +1373,7 @@ class OpH5ReaderBigDataset(Operator):
         
         self._lock = Lock()
         
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         filename = str(self.inputs["Filenames"].value[0])
         hdf5Path = self.inputs["hdf5Path"].value
         
@@ -1412,7 +1410,8 @@ class OpH5ReaderBigDataset(Operator):
             self.F.append(f)
             self.D.append(d)
         
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
+        key = roi.toSlice()
         filenames = self.inputs["Filenames"].value
         
         hdf5Path = self.inputs["hdf5Path"].value
@@ -1438,6 +1437,7 @@ class OpH5ReaderBigDataset(Operator):
                 maxError = error
         
         result[:]=self.D[index][key]
+        return result
         self._lock.release()
     """
     def notifyDisconnect(self, slot):
@@ -1457,7 +1457,7 @@ class OpH5ReaderSmoothedDataset(Operator):
     outputSlots = [MultiOutputSlot("Outputs"),MultiOutputSlot("Sigmas")]
     
         
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         
         #get the shape and other stuff from the first dataset
         self.sigmas=[]
@@ -1482,7 +1482,7 @@ class OpH5ReaderSmoothedDataset(Operator):
             result[:]=self.D[indexFile][index][key]
         elif slot.name=='Sigmas':
             result[:]=self.sigmas[index]
-           
+        return result
           
     def _setTheOutPutSlotsAndSigmas(self):
         firstfile = self.inputs["Filenames"].value[0]
@@ -1549,7 +1549,7 @@ class OpStackLoader(Operator):
     inputSlots = [InputSlot("globstring", stype = "string")]
     outputSlots = [OutputSlot("stack")]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         globString = self.inputs["globstring"].value
         self.fileNameList = sorted(glob.glob(globString))
         
@@ -1571,12 +1571,14 @@ class OpStackLoader(Operator):
             oslot._dtype = None
             oslot._axistags = None
             
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
+        key = roi.toSlice()
         i=0
         for fileName in self.fileNameList[key[2]]:
             assert (self.info.getShape() == vigra.impex.ImageInfo(fileName).getShape()), 'not all files have the same shape'
             result[:,:,i,:] = vigra.impex.readImage(fileName)[key[0],key[1],key[3]]
             i = i+1
+        return result
 
 class OpGrayscaleInverter(Operator):
     name = "Grayscale Inversion Operator"
@@ -1585,7 +1587,7 @@ class OpGrayscaleInverter(Operator):
     inputSlots = [InputSlot("input", stype = "array")]
     outputSlots = [OutputSlot("output")]
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
 
         inputSlot = self.inputs["input"]
 
@@ -1594,11 +1596,11 @@ class OpGrayscaleInverter(Operator):
         oslot._dtype = inputSlot.dtype
         oslot._axistags = copy.copy(inputSlot.axistags)
 
-    def getOutSlot(self, slot, key, result):
-        
+    def execute(self, slot, roi, result):
         #this assumes that the last dimension is the channel. 
         image = self.inputs["input"][:].allocate().wait()
         result[:,:,:,:] = 255-image[:,:,:,:]
+        return result
 
 class OpToUint8(Operator):
     name = "UInt8 Conversion Operator"
@@ -1608,7 +1610,7 @@ class OpToUint8(Operator):
     outputSlots = [OutputSlot("output")]
     
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
 
         inputSlot = self.inputs["input"]
 
@@ -1618,10 +1620,11 @@ class OpToUint8(Operator):
         oslot._dtype = numpy.uint8
         oslot._axistags = copy.copy(inputSlot.axistags)
 
-        def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
         
-            image = self.inputs["input"][:].allocate().wait()
-            result[:] = image.numpy.astype('uint8')
+        image = self.inputs["input"][:].allocate().wait()
+        result[:] = image.numpy.astype('uint8')
+        return result
 
 
 class OpRgbToGraysacle(Operator):
@@ -1631,7 +1634,7 @@ class OpRgbToGraysacle(Operator):
     inputSlots = [InputSlot("input", stype = "array")]
     outputSlots = [OutputSlot("output")]
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
 
         inputSlot = self.inputs["input"]
 
@@ -1641,14 +1644,13 @@ class OpRgbToGraysacle(Operator):
         oslot._dtype = inputSlot.dtype
         oslot._axistags = copy.copy(inputSlot.axistags)
     
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
         
         #this assumes that the last dimension is the channel. 
         image = self.inputs["input"][:].allocate().wait()
         if image.shape[-1] > 1:
             result[:,:,:,0] = (numpy.round(0.299*image[:,:,:,0] + 0.587*image[:,:,:,1] + 0.114*image[:,:,:,2])).astype(int)
- 
-                
+        return result
            
         
         

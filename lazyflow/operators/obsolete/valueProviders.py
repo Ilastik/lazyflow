@@ -41,7 +41,7 @@ class ListToMultiOperator(Operator):
     inputSlots = [InputSlot("List", stype = "sequence")]
     outputSlots = [MultiOutputSlot("Items", level = 1)]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         inputSlot = self.inputs["List"]
         liste = self.inputs["List"].value
         self.outputs["Items"].resize(len(liste))
@@ -55,3 +55,4 @@ class ListToMultiOperator(Operator):
     def getSubOutSlot(self, slots, indexes, key, result):
         liste = self.inputs["List"].value
         result[0] = liste[indexes[0]]
+        return result

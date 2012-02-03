@@ -74,7 +74,7 @@ class OpMultiArraySlicer(Operator):
     name = "Multi Array Slicer"
     category = "Misc"
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         
         dtype=self.inputs["Input"].dtype
         flag=self.inputs["AxisFlag"].value
@@ -122,6 +122,7 @@ class OpMultiArraySlicer(Operator):
         writeKey = tuple(writeKey)
 
         result[:]=ttt[writeKey ]#+ (0,)]
+        return result
 
 
 class OpMultiArraySlicer2(Operator):
@@ -133,7 +134,7 @@ class OpMultiArraySlicer2(Operator):
     name = "Multi Array Slicer"
     category = "Misc"
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         
         dtype=self.inputs["Input"].dtype
         flag=self.inputs["AxisFlag"].value
@@ -183,6 +184,7 @@ class OpMultiArraySlicer2(Operator):
       
         ttt = self.inputs["Input"][newKey].allocate().wait()
         result[:]=ttt[:]
+        return result
 
 class OpMultiArrayStacker(Operator):
     inputSlots = [MultiInputSlot("Images"), InputSlot("AxisFlag"), InputSlot("AxisIndex")]
@@ -192,7 +194,7 @@ class OpMultiArrayStacker(Operator):
     description = "Stack inputs on any axis, including the ones which are not there yet"
     category = "Misc"
 
-    def notifyConnectAll(self):
+    def setOutputs(self):
         #This function is needed so that we don't depend on the order of connections.
         #If axis flag or axis index is connected after the input images, the shape is calculated
         #here
@@ -233,7 +235,8 @@ class OpMultiArrayStacker(Operator):
 
 
 
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
+        key = roi.toSlice()
         cnt = 0
         written = 0
         start, stop = roi.sliceToRoi(key, self.outputs["Output"].shape)
@@ -286,6 +289,7 @@ class OpMultiArrayStacker(Operator):
         
         for r in requests:
             r.wait()
+        return result
 
 
 class OpSingleChannelSelector(Operator):
@@ -295,15 +299,16 @@ class OpSingleChannelSelector(Operator):
     inputSlots = [InputSlot("Input"),InputSlot("Index",stype='integer')]
     outputSlots = [OutputSlot("Output")]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         self.outputs["Output"]._dtype =self.inputs["Input"].dtype 
         self.outputs["Output"]._shape = self.inputs["Input"].shape[:-1]+(1,)
         self.outputs["Output"]._axistags = self.inputs["Input"].axistags
         
         
         
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
         
+        key = roi.toSlice()
         index=self.inputs["Index"].value
         #FIXME: check the axistags for a multichannel image
         assert self.inputs["Input"].shape[-1]>index, "Requested channel out of Range"       
@@ -315,7 +320,7 @@ class OpSingleChannelSelector(Operator):
         
         
         result[...,0]=im[...,index]
-        
+        return result
 
     def notifyDirty(self, slot, key):
         key = key[:-1] + (slice(0,1,None),)
@@ -331,7 +336,7 @@ class OpSubRegion(Operator):
     inputSlots = [InputSlot("Input"), InputSlot("Start"), InputSlot("Stop")]
     outputSlots = [OutputSlot("Output")]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         start = self.inputs["Start"].value
         stop = self.inputs["Stop"].value
         assert isinstance(start, tuple)
@@ -351,7 +356,8 @@ class OpSubRegion(Operator):
         self.outputs["Output"]._axistags = self.inputs["Input"].axistags
         self.outputs["Output"]._dtype = self.inputs["Input"].dtype
 
-    def getOutSlot(self, slot, key, resultArea):
+    def execute(self, slot, roi, resultArea):
+        key = roi.toSlice()
         start = self.inputs["Start"].value
         stop = self.inputs["Stop"].value
         
@@ -381,7 +387,7 @@ class OpSubRegion(Operator):
       
         res = self.inputs["Input"][newKey].allocate().wait()
         resultArea[:] = res[resultKey]
-        
+        return resultArea
  
  
  
@@ -392,7 +398,7 @@ class OpMultiArrayMerger(Operator):
     name = "Merge Multi Arrays based on a variadic merging function"
     category = "Misc"
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         
         shape=self.inputs["Inputs"][0].shape
         axistags=copy.copy(self.inputs["Inputs"][0].axistags)
@@ -410,8 +416,8 @@ class OpMultiArrayMerger(Operator):
                        
         
             
-    def getOutSlot(self, slot, key, result):
-        
+    def execute(self, slot, roi, result):
+        key = roi.toSlice()
         requests=[]
         for input in self.inputs["Inputs"]:
             requests.append(input[key].allocate())
@@ -423,6 +429,7 @@ class OpMultiArrayMerger(Operator):
         fun=self.inputs["MergingFunction"].value
         
         result[:]=fun(data)
+        return result
         
         
         
@@ -433,7 +440,7 @@ class OpPixelOperator(Operator):
     inputSlots = [InputSlot("Input"), InputSlot("Function")]
     outputSlots = [OutputSlot("Output")]    
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
 
         inputSlot = self.inputs["Input"]
 
@@ -445,16 +452,17 @@ class OpPixelOperator(Operator):
         
 
         
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
         
-        
+        key = roi.toSlice()
         matrix = self.inputs["Input"][key].allocate().wait()
         matrix = self.function(matrix)
         
         result[:] = matrix[:]
+        return result
 
 
-    def notifyDirty(selfut,slot,key):
+    def notifyDirty(self,slot,key):
         self.outputs["Output"].setDirty(key)
 
     @property
