@@ -345,13 +345,13 @@ class OpArrayBlockCache(OpArrayPiper):
                 self._cache[acc] = numpy.zeros(tuple(self._blockShape), dtype=self.dtype)
                 self._queryQueue[acc] = BlockQueue()
     
-    def getOutSlot(self,slot,key,result):
+    def execute(self,slot,roi,result):
+        key = roi.toSlice()
         start, stop = sliceToRoi(key, self.shape)
-        
         cachingBlockQuery3(self.inputs["Input"], result, start, stop, self.shape, self._blockShape, self._dirtyIndices, self._dirtyArray, self._dirtyState, self._cache, self._queryQueue)
         #cachingBlockQuery2(self.inputs["Input"], result, start, stop, self.shape, self._blockShape, self._dirtyIndices, self._dirtyArray, self._dirtyState, self._cache)
         #cachingFullBlockQuery(self.graph, self.inputs["Input"], result, start, stop, self.shape, self._blockShape, self._dirtyIndices, self._dirtyArray, self._dirtyState, self._cache)
-    
+        return result
 
     
     
@@ -365,7 +365,7 @@ class OpArraySliceCache(OpArrayPiper):
             blockShape = 64
         self._blockShape = blockShape
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         OpArrayPiper.notifyConnectAll(self)
         
         if type(self._blockShape) != tuple:
@@ -398,7 +398,8 @@ class OpArraySliceCache(OpArrayPiper):
         OpArrayPiper.setDirty(self, inputSlot=inputSlot)
         self._dirtyState += 1
 
-    def getOutSlot(self,slot,key,result):
+    def execute(self,slot,roi,result):
+        key = roi.toSlice()
         start, stop = sliceToRoi(key, self.shape)
         dim = (stop - start).argmin()
         print "SliceCache Request: ", start, stop, "--> dim ", dim, "shape: ", self._blockShapes[dim]
@@ -411,11 +412,13 @@ class OpArraySliceCache(OpArrayPiper):
         else:
             print "SliceCache: queriying graph..."
             dirtyBoxesQuery(self.inputs["Input"], result, start, stop, self.shape, self._blockShapes[dim], self._dirtyIndices[dim], self._dirtyArrays[dim], self._dirtyState, self._cache)
+        return result
 
 
 
 class OpArraySliceCacheBounding(OpArraySliceCache):
-    def getOutSlot(self,slot,key,result):
+    def execute(self,slot,roi,result):
+        key = roi.toSlice()
         start, stop = sliceToRoi(key, self.shape)
         dim = (stop - start).argmin()
         print "SliceCache Request: ", start, stop, "--> dim ", dim, "shape: ", self._blockShapes[dim]
@@ -428,4 +431,4 @@ class OpArraySliceCacheBounding(OpArraySliceCache):
         else:
             print "SliceCache: queriying graph..."
             dirtyBoundingBoxQuery(self.inputs["Input"], result, start, stop, self.shape, self._blockShapes[dim], self._dirtyIndices[dim], self._dirtyArrays[dim], self._dirtyState, self._cache)
-      
+        return result

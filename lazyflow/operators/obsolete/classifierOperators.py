@@ -18,7 +18,7 @@ class OpTrainRandomForest(Operator):
     inputSlots = [MultiInputSlot("Images"),MultiInputSlot("Labels"), InputSlot("fixClassifier", stype="bool")]
     outputSlots = [OutputSlot("Classifier")]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         if self.inputs["fixClassifier"].value == False:
             self.outputs["Classifier"]._dtype = object
             self.outputs["Classifier"]._shape = (1,)
@@ -26,8 +26,7 @@ class OpTrainRandomForest(Operator):
             self.outputs["Classifier"].setDirty((slice(0,1,None),))            
              
     
-    def getOutSlot(self, slot, key, result):
-        
+    def execute(self, slot, roi, result):
         featMatrix=[]
         labelsMatrix=[]
         for i,labels in enumerate(self.inputs["Labels"]):
@@ -59,6 +58,7 @@ class OpTrainRandomForest(Operator):
             print labelsMatrix.shape, labelsMatrix.dtype            
             
         result[0]=RF
+        return result
         
     def setInSlot(self, slot, key, value):
         if self.inputs["fixClassifier"].value == False:
@@ -86,7 +86,7 @@ class OpTrainRandomForestBlocked(Operator):
                   MultiInputSlot("nonzeroLabelBlocks")]
     outputSlots = [OutputSlot("Classifier")]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         if self.inputs["fixClassifier"].value == False:
             self.outputs["Classifier"]._dtype = object
             self.outputs["Classifier"]._shape = (1,)
@@ -94,7 +94,7 @@ class OpTrainRandomForestBlocked(Operator):
             self.outputs["Classifier"].setDirty((slice(0,1,None),))            
              
     
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
         
         featMatrix=[]
         labelsMatrix=[]
@@ -148,6 +148,7 @@ class OpTrainRandomForestBlocked(Operator):
             print labelsMatrix.shape, labelsMatrix.dtype            
         assert RF is not None, "RF = %r" % RF    
         result[0]=RF
+        return result
         
     def setInSlot(self, slot, key, value):
         if self.inputs["fixClassifier"].value == False:
@@ -174,7 +175,7 @@ class OpPredictRandomForest(Operator):
     inputSlots = [InputSlot("Image"),InputSlot("Classifier"),InputSlot("LabelsCount",stype='integer')]
     outputSlots = [OutputSlot("PMaps")]
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         inputSlot = self.inputs["Image"]    
         nlabels=self.inputs["LabelsCount"].value
         
@@ -199,7 +200,8 @@ class OpPredictRandomForest(Operator):
         oslot._shape = islot.shape[:-1]+(nlabels,)
         
 
-    def getOutSlot(self,slot, key, result):
+    def execute(self,slot, roi, result):
+        key = roi.toSlice()
         nlabels=self.inputs["LabelsCount"].value
 
         RF=self.inputs["Classifier"].value
@@ -224,7 +226,7 @@ class OpPredictRandomForest(Operator):
         
         #result[:]=prediction[...,key[-1]]
         result[:]=prediction[...,key[-1]]*255
-
+        return result
 
             
     def notifyDirty(self, slot, key):
@@ -243,7 +245,7 @@ class OpSegmentation(Operator):
     inputSlots = [InputSlot("Input")]
     outputSlots = [OutputSlot("Output")]    
     
-    def notifyConnectAll(self):
+    def setupOutputs(self):
 
         inputSlot = self.inputs["Input"]
         
@@ -252,10 +254,11 @@ class OpSegmentation(Operator):
         self.outputs["Output"]._axistags = inputSlot.axistags
         
           
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
         
+        key = roi.toSlice()
         shape = self.inputs["Input"].shape
-        rstart, rstop = sliceToRoi(key, self.outputs["Output"]._shape)  
+        rstart, rstop = sliceToRoi(key, self.outputs["Output"]._shape)
         rstart.append(0)
         rstop.append(shape[-1])
         rkey = roiToSlice(rstart,rstop)
@@ -281,7 +284,7 @@ class OpSegmentation(Operator):
         seg.resize(img.shape[:-1])
 
         result[:] = seg[:]            
-            
+        return result
 
 
     def notifyDirty(self,slot,key):
@@ -303,11 +306,11 @@ class OpAreas(Operator):
     inputSlots = [InputSlot("Input"), InputSlot("NumberOfChannels")]
     outputSlots = [OutputSlot("Areas")]    
        
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         
         self.outputs["Areas"]._shape = (self.inputs["NumberOfChannels"].value,)
  
-    def getOutSlot(self, slot, key, result):
+    def execute(self, slot, roi, result):
          
         img = self.inputs["Input"][:].allocate().wait()   
         
@@ -321,7 +324,7 @@ class OpAreas(Operator):
             areas[int(i)] +=1
 
         result[:] = numpy.array(areas)
-            
+        return result
 
 
     def notifyDirty(self,slot,key):
