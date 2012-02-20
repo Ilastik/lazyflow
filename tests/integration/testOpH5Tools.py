@@ -5,7 +5,7 @@ import os
 
 class OpH5WriterTest():
     
-    def __init__(self,dimension = (5,100,100,100,5),testdirectory = './opWriterTest',filename = 'writeTestFile.h5',hdf5path = 'volume/data',):
+    def __init__(self,dimension = (5,20,20,20,5),testdirectory = './opWriterTest/',filename = 'writeTestFile.h5',hdf5path = 'volume/data',):
         
         self.dim = dimension
         self.testdir = testdirectory
@@ -16,7 +16,7 @@ class OpH5WriterTest():
 
         g = Graph()
         self.writer = OpH5Writer(g)
-        self.writer.inputs["Filename"].setValue(filename)
+        self.writer.inputs["Filename"].setValue(self.testdir+filename)
         self.writer.inputs["hdf5Path"].setValue(hdf5path)
 
 
