@@ -9,7 +9,7 @@ from lazyflow.operators.obsolete.vigraOperators import \
     OpHessianOfGaussianEigenvalues, OpStructureTensorEigenvalues,\
     OpHessianOfGaussianEigenvaluesFirst, OpHessianOfGaussian,\
     OpGaussianGradientMagnitude, OpLaplacianOfGaussian
-
+from lazyflow.roi import sliceToRoi
 
 class TestOpBaseVigraFilter(unittest.TestCase):
     
@@ -20,9 +20,12 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         
         self.volume = None
         self.testDim = (10,10,10,10,10)
+        self.keyNum = 10
+        self.eps = 0.001
         
         self.graph = Graph()
         self.sigmaList = [0.3,0.7,1,1.6,3.5,5.0,10.0]
+        self.sigmaComboList = [x for x in itertools.product(self.sigmaList,self.sigmaList) if x[0]<x[1]]
         
         self.prepareVolume()
 
@@ -31,16 +34,44 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         self.volume = vigra.VigraArray(self.testDim)
         self.volume[:] = numpy.random.rand(*self.testDim)
     
+    def generateKeys(self):
+        
+        tmp = numpy.zeros((5,2))
+        
+        while tmp[0,0] == tmp[0,1] or tmp[1,0] == tmp[1,1] or tmp[2,0] == tmp[2,1]\
+        or tmp[3,0] == tmp[3,1] or tmp[4,0] == tmp[4,1]:
+            
+            tmp = numpy.random.rand(5,2)
+            for i in range(5):
+                tmp[i,:] *= self.testDim[i]
+                tmp[i,:] = numpy.sort(numpy.round(tmp[i,:]))
+        
+        key = []
+        for i in range(5):
+            key.append(slice(int(tmp[i,0]),int(tmp[i,1]),1))
+        
+        return key
+    
+    def testBlocks(self,operator):
+        
+        eps = self.eps
+        block = operator.outputs["Output"][:].allocate().wait()
+        for i in range(self.keyNum):
+            key = self.generateKeys()
+            if (operator.outputs["Output"][key].allocate().wait() - block[key] < eps).all():
+                logging.debug('Operator successfully test on block (roi) '+str(sliceToRoi(key, block.shape))+' in tolerance limits of '+str(eps))
+                assert 1==1
+            
     def test_DifferenceOfGaussian(self):
         
         opDiffGauss = OpDifferenceOfGaussians(self.graph)
         opDiffGauss.inputs["Input"].setValue(self.volume)
         logging.debug('======================OpDifferenceOfGaussian===============')
-        for sigma0,sigma1 in itertools.product(self.sigmaList,self.sigmaList):
+        for sigma0,sigma1 in self.sigmaComboList:
             try:
                 opDiffGauss.inputs["sigma0"].setValue(sigma0)
                 opDiffGauss.inputs["sigma1"].setValue(sigma1)
-                opDiffGauss.outputs["Output"][:].allocate().wait()
+                self.testBlocks(opDiffGauss)
             except:
                 logging.debug('Test failed for the following sigma-combination : %s,%s'%(sigma0,sigma1))
         assert 1==1
@@ -53,7 +84,7 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         for sigma in self.sigmaList:
             try:
                 opSmoothGauss.inputs["sigma"].setValue(sigma)
-                opSmoothGauss.outputs["Output"][:].allocate().wait()
+                self.testBlocks(opSmoothGauss)
             except:
                 logging.debug('Test failed for the following sigma: %s'%sigma)
         assert 1==1
@@ -63,11 +94,11 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         opCohenrece = OpCoherenceOrientation(self.graph)
         opCohenrece.inputs["Input"].setValue(self.volume)
         logging.debug('===================OpCoherenceOrientation==================')
-        for sigma0,sigma1 in itertools.product(self.sigmaList,self.sigmaList):
+        for sigma0,sigma1 in self.sigmaComboList:
             try:
                 opCohenrece.inputs["sigma0"].setValue(sigma0)
                 opCohenrece.inputs["sigma1"].setValue(sigma1)
-                opCohenrece.outputs["Output"][:].allocate().wait()
+                self.testBlocks(opCohenrece)
             except:
                 logging.debug('Test failed for the following sigma-combination : %s,%s'%(sigma0,sigma1))
         assert 1==1
@@ -80,7 +111,7 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         for sigma in self.sigmaList:
             try:
                 opHessianOfGaussian.inputs["scale"].setValue(sigma)
-                opHessianOfGaussian.outputs["Output"][:].allocate().wait()
+                self.testBlocks(opHessianOfGaussian)
             except:
                 logging.debug('Test failed for the following sigma: %s'%sigma)
         assert 1==1
@@ -90,11 +121,11 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         opStructureTensor = OpStructureTensorEigenvalues(self.graph)
         opStructureTensor.inputs["Input"].setValue(self.volume)
         logging.debug('================OpStructureTensorEigenvalues===============')
-        for sigma0,sigma1 in itertools.product(self.sigmaList,self.sigmaList):
+        for sigma0,sigma1 in self.sigmaComboList:
             try:
                 opStructureTensor.inputs["innerScale"].setValue(sigma0)
                 opStructureTensor.inputs["outerScale"].setValue(sigma1)
-                opStructureTensor.outputs["Output"][:].allocate().wait()
+                self.testBlocks(opStructureTensor)
             except:
                 logging.debug('Test failed for the following sigma-combination : %s,%s'%(sigma0,sigma1))
         assert 1==1
@@ -107,7 +138,7 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         for sigma in self.sigmaList:
             try:
                 opHessianOfGaussianEF.inputs["scale"].setValue(sigma)
-                opHessianOfGaussianEF.outputs["Output"][:].allocate().wait()
+                self.testBlocks(opHessianOfGaussianEF)
             except:
                 logging.debug('Test failed for the following sigma: %s'%sigma)
         assert 1==1
@@ -121,7 +152,7 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         for sigma in self.sigmaList:
             try:
                 opHessianOfGaussian.inputs["sigma"].setValue(sigma)
-                opHessianOfGaussian.outputs["Output"][:].allocate().wait()
+                self.testBlocks(opHessianOfGaussian)
             except:
                 logging.debug('Test failed for the following sigma: %s'%sigma)
         assert 1==1
@@ -135,7 +166,7 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         for sigma in self.sigmaList:
             try:
                 opGaussianGradient.inputs["sigma"].setValue(sigma)
-                opGaussianGradient.outputs["Output"][:].allocate().wait()
+                self.testBlocks(opGaussianGradient)
             except:
                 logging.debug('Test failed for the following sigma: %s'%sigma)
         assert 1==1
@@ -147,7 +178,7 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         for sigma in self.sigmaList:
             try:
                 opLaplacianOfGaussian.inputs["scale"].setValue(sigma)
-                opLaplacianOfGaussian.outputs["Output"][:].allocate().wait()
+                self.testBlocks(opLaplacianOfGaussian)
             except:
                 logging.debug('Test failed for the following sigma: %s'%sigma)
         assert 1==1
