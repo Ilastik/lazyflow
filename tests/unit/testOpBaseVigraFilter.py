@@ -24,7 +24,7 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         self.eps = 0.001
         
         self.graph = Graph()
-        self.sigmaList = [0.3,0.7,1,1.6,3.5,5.0,10.0]
+        self.sigmaList = [0.3,0.7,1,1.6]#+[3.5,5.0,10.0]
         self.sigmaComboList = [x for x in itertools.product(self.sigmaList,self.sigmaList) if x[0]<x[1]]
         
         self.prepareVolume()
@@ -33,7 +33,9 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         
         self.volume = vigra.VigraArray(self.testDim)
         self.volume[:] = numpy.random.rand(*self.testDim)
-    
+        self.twoDvolume = vigra.VigraArray((10,10,1))
+        self.twoDvolume[:] = numpy.random.rand(10,10,1)
+        
     def generateKeys(self):
         
         tmp = numpy.zeros((5,2))
@@ -92,7 +94,7 @@ class TestOpBaseVigraFilter(unittest.TestCase):
     def test_CoherenceOrientation(self):
         
         opCohenrece = OpCoherenceOrientation(self.graph)
-        opCohenrece.inputs["Input"].setValue(self.volume)
+        opCohenrece.inputs["Input"].setValue(self.twoDvolume)
         logging.debug('===================OpCoherenceOrientation==================')
         for sigma0,sigma1 in self.sigmaComboList:
             try:
