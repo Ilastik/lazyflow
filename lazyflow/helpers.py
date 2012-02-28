@@ -1,8 +1,4 @@
-<<<<<<< HEAD
 import os,numpy,itertools
-=======
-import os,numpy
->>>>>>> upstream/master
 from lazyflow.config import CONFIG
 
 
