@@ -22,7 +22,7 @@ class TestOpBaseVigraFilter(unittest.TestCase):
         self.volume = None
         self.testDim = (20,20,20,20)
         self.keyNum = 5
-        self.eps = 1
+        self.eps = 0.001
         self.windowSize = 4
         
         self.graph = Graph()
@@ -83,19 +83,19 @@ class TestOpBaseVigraFilter(unittest.TestCase):
                 logging.debug('Test failed for the following sigma: %s'%sigma)
         assert 1==1
     
-    def test_CoherenceOrientation(self):
-        
-        opCoherence = OpCoherenceOrientation(self.graph)
-        opCoherence.inputs["Input"].setValue(self.twoDvolume)
-        logging.debug('===================OpCoherenceOrientation==================')
-        for sigma0,sigma1 in self.sigmaComboList:
-            try:
-                opCoherence.inputs["sigma0"].setValue(sigma0)
-                opCoherence.inputs["sigma1"].setValue(sigma1)
-                self.compareBlocks(opCoherence,sigma1)
-            except:
-                logging.debug('Test failed for the following sigma-combination : %s,%s'%(sigma0,sigma1))
-        assert 1==1
+#    def test_CoherenceOrientation(self):
+#        
+#        opCoherence = OpCoherenceOrientation(self.graph)
+#        opCoherence.inputs["Input"].setValue(self.twoDvolume)
+#        logging.debug('===================OpCoherenceOrientation==================')
+#        for sigma0,sigma1 in self.sigmaComboList:
+#            try:
+#                opCoherence.inputs["sigma0"].setValue(sigma0)
+#                opCoherence.inputs["sigma1"].setValue(sigma1)
+#                self.compareBlocks(opCoherence,sigma1)
+#            except:
+#                logging.debug('Test failed for the following sigma-combination : %s,%s'%(sigma0,sigma1))
+#        assert 1==1
     
     def test_HessianOfGaussianEigenvalues(self):
         
