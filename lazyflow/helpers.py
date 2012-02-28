@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 import os,numpy,itertools
+=======
+import os,numpy
+>>>>>>> upstream/master
 from lazyflow.config import CONFIG
 
 
@@ -112,5 +116,3 @@ def generateRandomRoi(maxShape,minShape = 0,minWidth = 0):
         roi = [sorted([numpy.random.randint(minDim,maxDim),numpy.random.randint(minDim,maxDim)]) for minDim,maxDim in zip(minShape,maxShape)]
     roi = [[x[0] for x in roi],[x[1] for x in roi]]
     return roi
-    
-    
