@@ -189,4 +189,3 @@ def block_view(A, block= (3, 3)):
     shape= (A.shape[0]/ block[0], A.shape[1]/ block[1])+ block
     strides= (block[0]* A.strides[0], block[1]* A.strides[1])+ A.strides
     return ast(A, shape= shape, strides= strides)
-
