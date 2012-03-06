@@ -110,7 +110,7 @@ def generateRandomRoi(maxShape,minShape = 0,minWidth = 0):
     roi = [[0,0]]
     while len([x for x in roi if not abs(x[0]-x[1]) < minWidth]) < len(maxShape):
         roi = [sorted([numpy.random.randint(minDim,maxDim),numpy.random.randint(minDim,maxDim)]) for minDim,maxDim in zip(minShape,maxShape)]
-    roi = [[x[0] for x in roi],[x[1] for x in roi]]
+    roi = [TinyVector([x[0] for x in roi]),TinyVector([x[1] for x in roi])]
     return roi
 
 
