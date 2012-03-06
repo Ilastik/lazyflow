@@ -618,7 +618,6 @@ class Slot(object):
         return self.stype.writeIntoDestination(destination,value, roi)
                            
     def __getitem__(self, key):
-        print key
         if self.level > 0:
             return self._subSlots[key]
         else:
