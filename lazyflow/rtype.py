@@ -1,5 +1,5 @@
 from roi import sliceToRoi, roiToSlice
-import vigra,numpy
+import vigra,numpy,copy
 from lazyflow.roi import TinyVector
 
 class Roi(object):
@@ -29,7 +29,7 @@ class SubRegion(Roi):
     
     def setAxistags(self,axistags):
         assert type(axistags) == vigra.vigranumpycore.AxisTags
-        self.axistags = axistags
+        self.axistags = copy.copy(axistags)
     
     def expandByShape(self,shape):
         """
@@ -65,6 +65,13 @@ class SubRegion(Roi):
         self.start.pop(popKey)
         self.stop.pop(popKey)
     
+    def centerIn(self,shape):
+        difference = [int(((shape-(stop-start))/2.0)) for (shape,start),stop in zip(zip(shape,self.start),self.stop)]  
+        dimension = [int(stop-start) for start,stop in zip(self.start,self.stop)]
+        self.start = TinyVector(difference)
+        self.stop = TinyVector([diff+dim for diff,dim in zip(difference,dimension)])
+    
+        
     def changeCoordinateSystemTo(self,shape):
         pass
             
