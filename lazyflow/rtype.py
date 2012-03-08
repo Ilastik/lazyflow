@@ -58,10 +58,7 @@ class SubRegion(Roi):
         self.stop = TinyVector([x-s for x,s in zip(self.stop,shape)])
     
     def popAxis(self,axis):
-        for tag,i in zip(self.axistags,range(len(self.axistags))):
-            if tag.key == axis:
-                self.axistags.__delitem__(i)
-                popKey = i
+        popKey = self.axistags.index(axis)
         self.start.pop(popKey)
         self.stop.pop(popKey)
     

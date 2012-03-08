@@ -18,10 +18,15 @@ class OpBaseVigraFilter(OpArrayPiper):
     def __init__(self, parent):
         OpArrayPiper.__init__(self, parent)
     
+    def resultingChannels(self):
+        return 1
+    
     def setupOutputs(self):
         
         inputSlot = self.inputs["input"]
         outputSlot = self.outputs["output"]
+        channelNum = self.resultingChannels()
+        print type(inputSlot.dtype)
         
         outputSlot._dtype = inputSlot.dtype
         outputSlot._shape = inputSlot.shape
@@ -58,21 +63,24 @@ class OpBaseVigraFilter(OpArrayPiper):
     
     def execute(self,slot,roi,result):
         
+        #Get axistags and sigma of inputdata
         axistags = self.inputs["input"].axistags
         sigma = self.inputs["sigma"].value
         
+        #Set roi to retrieve neccessary sourcedata
         roi.setAxistags(axistags)
         roi.expandByShape(sigma*self.windowSize)
         
         source = self.inputs["input"](roi.start,roi.stop).wait()
         source = vigra.VigraArray(source,axistags=axistags)
         
+        #Set roi to work with vigra filter
         roi.decreaseByShape(sigma*self.windowSize)
         roi.centerIn(source.shape)
         roi.popAxis('c')
         
         spaceIterator = AxisIterator(source,'spatialc',result,'spatialc')
-
+        
         for srckey,trgtkey in spaceIterator:
             self.vigraFilter(source[srckey],sigma,out=result[trgtkey],roi=(roi.start,roi.stop))
             
@@ -82,12 +90,6 @@ class OpGaussianSmoothing(OpBaseVigraFilter):
     
     vigraFilter = staticmethod(vigra.filters.gaussianSmoothing)
     outputDtype = numpy.float32 
-
-    def resultingChannels(self):
-        return 1
-    
-    def setupOutputs(self):
-        OpBaseVigraFilter.setupOutputs(self)
         
 class OpHessianOfGaussian(OpBaseVigraFilter):
     name = "HessianOfGaussian"
@@ -95,8 +97,8 @@ class OpHessianOfGaussian(OpBaseVigraFilter):
     outputDtype = numpy.float32 
     
     def resultingChannels(self):
-        temp = self.inputs["Input"].axistags.axisTypeCount(vigra.AxisType.Space)*(self.inputs["Input"].axistags.axisTypeCount(vigra.AxisType.Space) + 1) / 2
-        return temp
+        return self.inputs["input"].axistags.axisTypeCount(vigra.AxisType.Space)*(self.inputs["input"].axistags.axisTypeCount(vigra.AxisType.Space) + 1) / 2
+         
         
 from lazyflow.graph import Graph        
 
@@ -106,10 +108,11 @@ if __name__ == "__main__":
     vol = vigra.VigraArray((200,200,1))
     vol[20:180,20:180,0] = 1
     vol[:]  = 1 - vol[:]
+    result = vigra.VigraArray((200,200,3))
     vigra.impex.writeImage(vol,'davor.png')
-    result = vigra.filters.hessianOfGaussian(vol, 5.0)
+    vigra.filters.hessianOfGaussian(vol, 5.0,out = result)
     vigra.impex.writeImage(result,'danach.png')
     op.inputs["input"].setValue(vol)
-    op.inputs["sigma"].setValue(2.0)
+    op.inputs["sigma"].setValue(5.0)
     roi = [TinyVector([60,60,0]),TinyVector([140,140,1])]
     op.outputs["output"](roi[0], roi[1]).wait()
