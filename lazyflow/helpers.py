@@ -113,6 +113,23 @@ def generateRandomRoi(maxShape,minShape = 0,minWidth = 0):
     roi = [TinyVector([x[0] for x in roi]),TinyVector([x[1] for x in roi])]
     return roi
 
+class OutputConfigurator(object):
+    
+    def __init__(self,inSlot):
+        
+        self.inSlot = inSlot
+        self.axistags = inSlot.axistags
+        self.shape = inSlot.shape
+        self.dtype = inSlot.dtype
+    
+    def expandShapeAtAxisTo(self,axis,length):
+        
+        tmpshape = list(self.shape)
+        tmpshape[self.axistags.index(axis)] = length
+        self.shape = tuple(tmpshape)
+    
+    def getShape(self):
+        return self.shape
 
 class AxisIterator:
     def __init__(self, source, sourceAxis, destination, destinationAxis):

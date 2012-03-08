@@ -1,6 +1,6 @@
 from lazyflow.graph import Operator,InputSlot,OutputSlot
 from lazyflow.operators import OpArrayPiper
-from lazyflow.helpers import AxisIterator,generateRandomRoi
+from lazyflow.helpers import AxisIterator,generateRandomRoi,OutputConfigurator
 import numpy,vigra,copy
 from lazyflow.roi import TinyVector
 
@@ -26,10 +26,12 @@ class OpBaseVigraFilter(OpArrayPiper):
         inputSlot = self.inputs["input"]
         outputSlot = self.outputs["output"]
         channelNum = self.resultingChannels()
-        print type(inputSlot.dtype)
         
+        outConfig = OutputConfigurator(inputSlot)
+        outConfig.expandShapeAtAxisTo('c', channelNum)
+                
         outputSlot._dtype = inputSlot.dtype
-        outputSlot._shape = inputSlot.shape
+        outputSlot._shape = outConfig.getShape()
         outputSlot._axistags = copy.copy(inputSlot.axistags)
         
         ################################################
@@ -79,6 +81,8 @@ class OpBaseVigraFilter(OpArrayPiper):
         roi.centerIn(source.shape)
         roi.popAxis('c')
         
+        print result.shape
+        
         spaceIterator = AxisIterator(source,'spatialc',result,'spatialc')
         
         for srckey,trgtkey in spaceIterator:
@@ -115,4 +119,4 @@ if __name__ == "__main__":
     op.inputs["input"].setValue(vol)
     op.inputs["sigma"].setValue(5.0)
     roi = [TinyVector([60,60,0]),TinyVector([140,140,1])]
-    op.outputs["output"](roi[0], roi[1]).wait()
+    op.outputs["output"]().wait()
