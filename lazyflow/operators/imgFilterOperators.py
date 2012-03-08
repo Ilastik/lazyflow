@@ -32,6 +32,7 @@ class OpBaseVigraFilter(OpArrayPiper):
                 
         outputSlot._dtype = inputSlot.dtype
         outputSlot._shape = outConfig.getShape()
+        print outConfig.getShape()
         outputSlot._axistags = copy.copy(inputSlot.axistags)
         
         ################################################
