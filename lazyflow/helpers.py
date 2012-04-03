@@ -1,4 +1,4 @@
-import os,numpy,itertools
+import os,numpy,itertools,copy
 from lazyflow.config import CONFIG
 from lazyflow.roi import TinyVector
 
@@ -115,12 +115,19 @@ def generateRandomRoi(maxShape,minShape = 0,minWidth = 0):
 
 class OutputConfigurator(object):
     
-    def __init__(self,inSlot):
+    def __init__(self,inSlot,outSlot):
         
         self.inSlot = inSlot
+        self.outSlot = outSlot
         self.axistags = inSlot.axistags
         self.shape = inSlot.shape
         self.dtype = inSlot.dtype
+    
+    def setOutputLikeInput(self):
+        
+        self.outSlot._dtype = self.inSlot.dtype
+        self.outSlot._shape = self.inSlot.shape
+        self.outSlot._axistags = copy.copy(self.inSlot.axistags)
     
     def expandShapeAtAxisTo(self,axis,length):
         
@@ -128,8 +135,8 @@ class OutputConfigurator(object):
         tmpshape[self.axistags.index(axis)] = length
         self.shape = tuple(tmpshape)
     
-    def getShape(self):
-        return self.shape
+    def getOutSlot(self):
+        return self.outSlot
 
 class AxisIterator:
     def __init__(self, source, sourceAxis, destination, destinationAxis):

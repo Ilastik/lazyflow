@@ -27,14 +27,15 @@ class OpBaseVigraFilter(OpArrayPiper):
         outputSlot = self.outputs["output"]
         channelNum = self.resultingChannels()
         
-        outConfig = OutputConfigurator(inputSlot)
+        outConfig = OutputConfigurator(inputSlot,outputSlot)
+        outConfig.setOutputLikeInput()
         outConfig.expandShapeAtAxisTo('c', channelNum)
                 
-        outputSlot._dtype = inputSlot.dtype
-        outputSlot._shape = outConfig.getShape()
-        print outConfig.getShape()
-        outputSlot._axistags = copy.copy(inputSlot.axistags)
+        outputSlot = outConfig.getOutSlot()
         
+        print outputSlot._dtype
+        print outputSlot._shape
+        print outputSlot._axistags
         ################################################
 #        numChannels  = 1
 #        inputSlot = self.inputs["Input"]
@@ -69,21 +70,25 @@ class OpBaseVigraFilter(OpArrayPiper):
         #Get axistags and sigma of inputdata
         axistags = self.inputs["input"].axistags
         sigma = self.inputs["sigma"].value
+        inputShape  = self.inputs["input"].shape
         
         #Set roi to retrieve neccessary sourcedata
         roi.setAxistags(axistags)
-        roi.expandByShape(sigma*self.windowSize)
+        
+        if not roi.isEqualTo(inputShape):
+            roi.expandByShape(sigma*self.windowSize)
+        roi.setStopAtAxisTo('c',inputShape[int(axistags.channelIndex)])
         
         source = self.inputs["input"](roi.start,roi.stop).wait()
         source = vigra.VigraArray(source,axistags=axistags)
         
+        
         #Set roi to work with vigra filter
-        roi.decreaseByShape(sigma*self.windowSize)
+        if not roi.isEqualTo(inputShape):
+            roi.decreaseByShape(sigma*self.windowSize)
         roi.centerIn(source.shape)
         roi.popAxis('c')
-        
-        print result.shape
-        
+
         spaceIterator = AxisIterator(source,'spatialc',result,'spatialc')
         
         for srckey,trgtkey in spaceIterator:

@@ -68,9 +68,21 @@ class SubRegion(Roi):
         self.start = TinyVector(difference)
         self.stop = TinyVector([diff+dim for diff,dim in zip(difference,dimension)])
     
+    def isEqualTo(self,shape):
+        channelKey = self.axistags.index('c')
+        dim = [stop-start for start,stop in zip(self.start,self.stop)]
+        shape = list(shape)
+        dim.pop(channelKey)
+        shape.pop(channelKey)
+        if dim == list(shape):
+            return True
+        else:
+            return False
+    
+    def setStopAtAxisTo(self,axis,length):
+        axisKey = self.axistags.index(axis)
+        self.stop[axisKey]=length
         
-    def changeCoordinateSystemTo(self,shape):
-        pass
-            
+                
     def toSlice(self, hardBind = False):
         return roiToSlice(self.start,self.stop, hardBind)
