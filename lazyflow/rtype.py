@@ -1,5 +1,5 @@
 from roi import sliceToRoi, roiToSlice
-import vigra,numpy
+import vigra,numpy,copy
 from lazyflow.roi import TinyVector
 
 class Roi(object):
@@ -29,7 +29,7 @@ class SubRegion(Roi):
     
     def setAxistags(self,axistags):
         assert type(axistags) == vigra.vigranumpycore.AxisTags
-        self.axistags = axistags
+        self.axistags = copy.copy(axistags)
     
     def expandByShape(self,shape):
         """
@@ -58,15 +58,31 @@ class SubRegion(Roi):
         self.stop = TinyVector([x-s for x,s in zip(self.stop,shape)])
     
     def popAxis(self,axis):
-        for tag,i in zip(self.axistags,range(len(self.axistags))):
-            if tag.key == axis:
-                self.axistags.__delitem__(i)
-                popKey = i
+        popKey = self.axistags.index(axis)
         self.start.pop(popKey)
         self.stop.pop(popKey)
     
-    def changeCoordinateSystemTo(self,shape):
-        pass
-            
+    def centerIn(self,shape):
+        difference = [int(((shape-(stop-start))/2.0)) for (shape,start),stop in zip(zip(shape,self.start),self.stop)]  
+        dimension = [int(stop-start) for start,stop in zip(self.start,self.stop)]
+        self.start = TinyVector(difference)
+        self.stop = TinyVector([diff+dim for diff,dim in zip(difference,dimension)])
+    
+    def isEqualTo(self,shape):
+        channelKey = self.axistags.index('c')
+        dim = [stop-start for start,stop in zip(self.start,self.stop)]
+        shape = list(shape)
+        dim.pop(channelKey)
+        shape.pop(channelKey)
+        if dim == list(shape):
+            return True
+        else:
+            return False
+    
+    def setStopAtAxisTo(self,axis,length):
+        axisKey = self.axistags.index(axis)
+        self.stop[axisKey]=length
+        
+                
     def toSlice(self, hardBind = False):
         return roiToSlice(self.start,self.stop, hardBind)
