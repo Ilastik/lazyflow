@@ -6,7 +6,7 @@ import numpy
 import vigra
 from math import sqrt
 from functools import partial
-from lazyflow.roi import roiToSlice
+from lazyflow.roi import roiToSlice, sliceToRoi
 
 class OpBaseVigraFilter(Operator):
     
@@ -28,6 +28,14 @@ class OpBaseVigraFilter(Operator):
     
     def setupFilter(self):
         pass
+    
+    def propagateDirty(self,slot,roi):
+        if slot == self.inputs["Input"]:
+            cIndex = self.inputs["Input"].axistags.channelIndex
+            retRoi = roi.copy()
+            retRoi.start[cIndex] *= self.channelsPerChannel()
+            retRoi.stop[cIndex] *= self.channelsPerChannel()
+            self.outputs["Output"].setDirty(retRoi)
     
     def setupIterator(self,source,result):
         self.iterator = AxisIterator(source,'spatialc',result,'spatialc',[(),(1,1,1,1,self.resultingChannels())])
@@ -276,6 +284,32 @@ class OpPixelFeaturesPresmoothed(Operator):
         self.operatorList = [OpGaussianSmoothing,OpLaplacianOfGaussian,\
                         OpStructureTensorEigenvalues,OpHessianOfGaussianEigenvalues,\
                         OpGaussianGradientMagnitude,OpDifferenceOfGaussians]
+    
+    def propagateDirty(self,slot,roi):
+        #this isn't tested yet. test it
+        if slot == self.inputs["Input"]:
+            cIndex = self.inputs["Input"].axistags.channelIndex
+            inMatrix = self.inputs["Matrix"].value
+            usedOperators = [reduce(lambda x,y: x or y,operator,False) for operator in inMatrix]
+            cCount = 0
+            opInstances = []
+            #make this a instance variable
+            scaleMultiplyList = [False,False,0.5,False,False,0.66]
+            for i in range(len(self.operatorList)):
+                op = self.operatorList[i](self.graph)
+                op.inputs["Input"].connect(self.inputs["Input"])
+                op.inputs["Sigma"].setValue(1.0)#dummy
+                if scaleMultiplyList[i]:
+                    op.inputs["Sigma2"].setValue(2.0)#dummy
+                opInstances.append(op)
+                
+            for i in range(len(usedOperators)):
+                if usedOperators[i]:
+                    roiCopy = roi.copy()
+                    roiCopy.start[cIndex] = cCount + roi.start[cIndex]*opInstances[i].channelsPerChannel()
+                    roiCopy.stop[cIndex] = cCount + roi.stop[cIndex]*opInstances[i].channelsPerChannel()
+                    self.outputs["Output"].setDirty(roiCopy)
+                cCount += (roi.stop[cIndex]-roi.start[cIndex])*opInstances[i].channelsPerChannel()
         
     def setupOutputs(self):
         
@@ -379,7 +413,7 @@ if __name__ == "__main__":
     op = OpGaussianSmoothing(g)
     op.inputs["Input"].setValue(v)
     op.inputs["Sigma"].setValue(1.0)
-    print op.outputs["Output"]([1,1,1],[7,7,4]).wait()  
+    op.outputs["Output"]([1,1,1],[7,7,4]).wait()  
                 
                 
         
