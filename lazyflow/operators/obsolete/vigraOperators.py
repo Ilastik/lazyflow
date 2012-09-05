@@ -6,6 +6,7 @@ from lazyflow import roi
 import copy
 
 from operators import OpArrayPiper, OpMultiArrayPiper
+from lazyflow.rtype import SubRegion
 
 from generic import OpMultiArrayStacker, getSubKeyWithFlags, popFlagsFromTheKey
 
@@ -114,7 +115,6 @@ class Op50ToMulti(OpXToMulti):
 
 class OpPixelFeaturesPresmoothed(Operator):
     name="OpPixelFeaturesPresmoothed"
-    name="OpPixelFeatures"
     category = "Vigra filter"
 
     inputSlots = [InputSlot("Input"),
@@ -122,9 +122,8 @@ class OpPixelFeaturesPresmoothed(Operator):
                   InputSlot("Scales"),
                   InputSlot("FeatureIds")] # The selection of features to compute
 
-    outputSlots = [OutputSlot("Output"),
-                   OutputSlot("ArrayOfOperators"),
-                   OutputSlot("FeatureNames")]
+    outputSlots = [OutputSlot("Output"),        # The entire block of features as a single image (many channels)
+                   MultiOutputSlot("Features")] # Each feature image listed separately, with feature name provided in metadata
 
     # Specify a default set & order for the features we compute
     DefaultFeatureIds = [ 'GaussianSmoothing',
@@ -231,30 +230,40 @@ class OpPixelFeaturesPresmoothed(Operator):
                         oparray[i][j].inputs["sigma1"].setValue(self.newScales[j]*0.66)
                         featureNameArray[i].append("Difference of Gaussians (s=" + str(self.scales[j]) + ")")
 
-            self.outputs["ArrayOfOperators"][0] = oparray
-
             #disconnecting all Operators
             for i in range(dimRow):
                 for j in range(dimCol):
                     self.multi.inputs["Input%02d" %(i*dimRow+j)].disconnect()
 
-            featureNames = []
+            channelCount = 0
+            featureCount = 0
+            self.featureOutputChannels = []
             #connect individual operators
             for i in range(dimRow):
                 for j in range(dimCol):
-                    val=self.matrix[i,j]
-                    if val:
-                        self.multi.inputs["Input%02d" %(i*dimRow+j)].connect(oparray[i][j].outputs["Output"])
-                        logger.debug("connected  Input%02d of self.multi" %(i*dimRow+j))
-                        featureNames.append(featureNameArray[i][j])
+                    if self.matrix[i,j]:
+                        # Feature names are provided via metadata
+                        oparray[i][j].outputs["Output"].meta.description = featureNameArray[i][j]
+                        self.multi.inputs["Input%02d" %(i*dimCol+j)].connect(oparray[i][j].outputs["Output"])
+                        logger.debug("connected  Input%02d of self.multi" %(i*dimCol+j))
 
+                        # Prepare the individual features
+                        featureCount += 1
+                        self.Features.resize( featureCount )
+
+                        featureMeta = oparray[i][j].outputs["Output"].meta
+                        featureChannels = featureMeta.shape[ featureMeta.axistags.index('c') ]
+                        self.Features[featureCount-1].meta.assignFrom( featureMeta )
+                        self.featureOutputChannels.append( (channelCount, channelCount + featureChannels) )
+                        channelCount += featureChannels
+            
             #additional connection with FakeOperator
             if (self.matrix==0).all():
                 fakeOp = OpGaussianSmoothing(self)
                 fakeOp.inputs["Input"].connect(self.source.outputs["Output"])
                 fakeOp.inputs["sigma"].setValue(10)
-                self.multi.inputs["Input%02d" %(i*dimRow+j+1)].connect(fakeOp.outputs["Output"])
-                self.multi.inputs["Input%02d" %(i*dimRow+j+1)].disconnect()
+                self.multi.inputs["Input%02d" %(i*dimCol+j+1)].connect(fakeOp.outputs["Output"])
+                self.multi.inputs["Input%02d" %(i*dimCol+j+1)].disconnect()
                 self.stacker.outputs["Output"]._shape=()
                 return
 
@@ -263,7 +272,6 @@ class OpPixelFeaturesPresmoothed(Operator):
             self.stacker.inputs["AxisFlag"].setValue('c')
             self.stacker.inputs["AxisIndex"].setValue(self.source.outputs["Output"]._axistags.index('c'))
             self.stacker.inputs["Images"].connect(self.multi.outputs["Outputs"])
-
 
             self.maxSigma = 0
             #determine maximum sigma
@@ -275,13 +283,58 @@ class OpPixelFeaturesPresmoothed(Operator):
 
             self.featureOps = oparray
 
+            # Output meta is a modified copy of the input meta
+            self.Output.meta.assignFrom(self.Input.meta)
+            self.Output.meta.dtype = numpy.float32
+            self.Output.meta.axistags = self.stacker.Output.meta.axistags
+            self.Output.meta.shape = self.stacker.Output.shape
 
-            self.outputs["Output"]._dtype = numpy.float32
-            self.outputs["Output"]._axistags = self.stacker.outputs["Output"]._axistags
-            self.outputs["Output"]._shape = self.stacker.outputs["Output"]._shape
+    def propagateDirty(self, inputSlot, roi):
+        if inputSlot == self.Input:
+            channelAxis = self.Input.meta.axistags.index('c')
+            numChannels = self.Input.meta.shape[channelAxis]
+            dirtyChannels = roi.stop[channelAxis] - roi.start[channelAxis]
+            
+            # If all the input channels were dirty, the dirty output region is a contiguous block
+            if dirtyChannels == numChannels:
+                dirtyKey = roiToSlice(roi.start, roi.stop)
+                dirtyKey[channelAxis] = slice(None)
+                dirtyRoi = sliceToRoi(dirtyKey, self.Output.meta.shape)
+                self.Output.setDirty(dirtyRoi)
+            else:
+                # Only some input channels were dirty, 
+                #  so we must mark each dirty output region separately.
+                numFeatures = self.Output.meta.shape[channelAxis] / numChannels
+                for featureIndex in range(numFeatures):
+                    startChannel = numChannels*featureIndex + roi.start[channelAxis]
+                    stopChannel = startChannel + roi.stop[channelAxis]
+                    dirtyRoi = copy.copy(roi)
+                    dirtyRoi.start[channelAxis] = startChannel
+                    dirtyRoi.stop[channelAxis] = stopChannel
+                    self.Output.setDirty(dirtyRoi)
 
-            # Set the feature names output
-            self.outputs["FeatureNames"].setValue(featureNames)
+        elif (inputSlot == self.Matrix
+              or inputSlot == self.Scales 
+              or inputSlot == self.FeatureIds):
+            self.Output.setDirty(slice(None))
+        else:
+            assert False, "Unknown dirty input slot."
+            
+
+    def getSubOutSlot(self, slots, indexes, key, result):
+        assert slots[0] == self.Features
+        index = indexes[0]
+        slot = self.Features[index]
+        key = list(key)
+        channelIndex = self.Input.meta.axistags.index('c')
+        
+        # Translate channel slice to the correct location for the output slot.
+        key[channelIndex] = slice(self.featureOutputChannels[index][0] + key[channelIndex].start,
+                                  self.featureOutputChannels[index][0] + key[channelIndex].stop)
+        roi = SubRegion(slot, pslice=key)
+
+        # Get output slot region for this channel
+        return self.execute(self.Output, roi, result)
 
     def execute(self, slot, rroi, result):
         if slot == self.outputs["Output"]:
@@ -660,10 +713,15 @@ class OpBaseVigraFilter(OpArrayPiper):
                         print "EXCEPT3", resultArea.shape,  tresKey, twriteKey
                         print "EXCEPT3", step, t.shape, timeAxis
                         raise
+                
+                #print "(in.min=",image.min(),",in.max=",image.max(),") (vres.min=",vres.min(),",vres.max=",vres.max(),")"
 
 
-
-    def notifyConnectAll(self):
+    def setupOutputs(self):
+        
+        # Output meta starts with a copy of the input meta, which is then modified
+        self.Output.meta.assignFrom(self.Input.meta)
+        
         numChannels  = 1
         inputSlot = self.inputs["Input"]
         if inputSlot.axistags.axisTypeCount(vigra.AxisType.Channels) > 0:
@@ -691,6 +749,9 @@ class OpBaseVigraFilter(OpArrayPiper):
         if self.outputs["Output"]._axistags.axisTypeCount(vigra.AxisType.Channels) == 0:
             self.outputs["Output"]._axistags.insertChannelAxis()
 
+        # The output data range is not necessarily the same as the input data range.
+        if 'drange' in self.Output.meta:
+            del self.Output.meta['drange']
 
     def resultingChannels(self):
         raise RuntimeError('resultingChannels() not implemented')
@@ -774,11 +835,6 @@ class OpGaussianSmoothing(OpBaseVigraFilter):
 
     def resultingChannels(self):
         return 1
-
-
-    def notifyConnectAll(self):
-        OpBaseVigraFilter.notifyConnectAll(self)
-
 
 class OpHessianOfGaussianEigenvalues(OpBaseVigraFilter):
     name = "HessianOfGaussianEigenvalues"
@@ -906,7 +962,7 @@ class OpImageReader(Operator):
     inputSlots = [InputSlot("Filename", stype = "filestring")]
     outputSlots = [OutputSlot("Image")]
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         filename = self.inputs["Filename"].value
 
         if filename is not None:
@@ -929,6 +985,12 @@ class OpImageReader(Operator):
         result[:] = temp[key]
         #self.outputs["Image"][:]=temp[:]
 
+    def propagateDirty(self, slot, roi):
+        if slot == self.Filename:
+            self.Image.setDirty(slice(None))
+        else:
+            assert False, "Unknown dirty input slot."
+
 import glob
 class OpFileGlobList(Operator):
     name = "Glob filenames to 1D-String Array"
@@ -937,7 +999,7 @@ class OpFileGlobList(Operator):
     inputSlots = [InputSlot("Globstring", stype = "string")]
     outputSlots = [MultiOutputSlot("Filenames", stype = "filestring")]
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         globstring = self.inputs["Globstring"].value
 
         self.filenames = glob.glob(globstring)
@@ -960,7 +1022,7 @@ class OpImageWriter(Operator):
 
     inputSlots = [InputSlot("Filename", stype = "filestring" ), InputSlot("Image")]
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         filename = self.inputs["Filename"].value
 
         imSlot = self.inputs["Image"]
@@ -987,7 +1049,7 @@ class OpH5Reader(Operator):
     outputSlots = [OutputSlot("Image")]
 
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         filename = self.inputs["Filename"].value
         hdf5Path = self.inputs["hdf5Path"].value
 
@@ -1067,12 +1129,15 @@ class OpH5WriterBigDataset(Operator):
         super(OpH5WriterBigDataset, self).__init__(*args, **kwargs)
         self.progressSignal = OrderedSignal()
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         self.outputs["WriteImage"].meta.shape = (1,)
         self.outputs["WriteImage"].meta.dtype = object
 
         self.f = self.inputs["hdf5File"].value
         hdf5Path = self.inputs["hdf5Path"].value
+        
+        # On windows, there may be backslashes.
+        hdf5Path = hdf5Path.replace('\\', '/')
 
         hdf5GroupName, datasetName = os.path.split(hdf5Path)
         if hdf5GroupName == "":
@@ -1124,6 +1189,9 @@ class OpH5WriterBigDataset(Operator):
                                 compression='gzip',
                                 compression_opts=4)
 
+        if 'drange' in self.Image.meta:
+            self.d.attrs['drange'] = self.Image.meta.drange
+
     def getOutSlot(self, slot, key, result):
         self.progressSignal(0)
         
@@ -1139,6 +1207,7 @@ class OpH5WriterBigDataset(Operator):
         for i in range( min(10, len(slicings)) ):
             s = slicings.pop()
             activeSlicings.append(s)
+            logger.debug( "Creating request for slicing {}".format(s) )
             activeRequests.append( self.inputs["Image"][s] )
         
         counter = 0
@@ -1196,6 +1265,11 @@ class OpH5WriterBigDataset(Operator):
             reqList.append(roiToSlice(start,stop))
         return reqList
 
+    def propagateDirty(self, slot, roi):
+        # The output from this operator isn't generally connected to other operators.
+        # If someone is using it that way, we'll assume that the user wants to know that 
+        #  the input image has become dirty and may need to be written to disk again.
+        self.WriteImage.setDirty(slice(None))
 
 class OpH5ReaderBigDataset(Operator):
 
@@ -1210,9 +1284,11 @@ class OpH5ReaderBigDataset(Operator):
 
         self._lock = Lock()
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         filename = str(self.inputs["Filenames"].value[0])
         hdf5Path = self.inputs["hdf5Path"].value
+        # On windows, there may be backslashes.
+        hdf5Path = hdf5Path.replace('\\', '/')
 
         f = h5py.File(filename, 'r')
 
@@ -1251,6 +1327,9 @@ class OpH5ReaderBigDataset(Operator):
         filenames = self.inputs["Filenames"].value
 
         hdf5Path = self.inputs["hdf5Path"].value
+        # On windows, there may be backslashes.
+        hdf5Path = hdf5Path.replace('\\', '/')
+
         F=[]
         D=[]
         ChunkList=[]
@@ -1292,7 +1371,7 @@ class OpH5ReaderSmoothedDataset(Operator):
     outputSlots = [MultiOutputSlot("Outputs"),MultiOutputSlot("Sigmas")]
 
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
 
         #get the shape and other stuff from the first dataset
         self.sigmas=[]
@@ -1324,6 +1403,8 @@ class OpH5ReaderSmoothedDataset(Operator):
         logger.debug("GUAGA",firstfile)
 
         hdf5Path = self.inputs["hdf5Path"].value
+        # On windows, there may be backslashes.
+        hdf5Path = hdf5Path.replace('\\', '/')
 
         f = h5py.File(firstfile, 'r')
         g = f[hdf5Path]
@@ -1348,6 +1429,8 @@ class OpH5ReaderSmoothedDataset(Operator):
 
     def _setChunksAndDatasets(self):
         hdf5Path = self.inputs["hdf5Path"].value
+        # On windows, there may be backslashes.
+        hdf5Path = hdf5Path.replace('\\', '/')
         for filename in self.inputs["Filenames"].value:
             f=h5py.File(filename, 'r')
             self.F.append(f)
@@ -1385,7 +1468,7 @@ class OpGrayscaleInverter(Operator):
     inputSlots = [InputSlot("input", stype = "array")]
     outputSlots = [OutputSlot("output")]
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
 
         inputSlot = self.inputs["input"]
 
@@ -1407,15 +1490,11 @@ class OpToUint8(Operator):
     outputSlots = [OutputSlot("output")]
 
 
-    def notifyConnectAll(self):
-
+    def setupOutputs(self):
         inputSlot = self.inputs["input"]
-
         oslot = self.outputs["output"]
-
-        oslot._shape = inputSlot.shape
-        oslot._dtype = numpy.uint8
-        oslot._axistags = copy.copy(inputSlot.axistags)
+        oslot.meta.assignFrom(inputSlot.meta)
+        oslot.meta.dtype = numpy.uint8
 
         def getOutSlot(self, slot, key, result):
 
@@ -1431,13 +1510,13 @@ class OpRgbToGrayscale(Operator):
     outputSlots = [OutputSlot("output")]
 
     def setupOutputs(self):
-
         inputSlot = self.inputs["input"]
-
         oslot = self.outputs["output"]
-        oslot._shape = inputSlot.shape[:-1] + (1,)
-        oslot._dtype = inputSlot.dtype
-        oslot._axistags = copy.copy(inputSlot.axistags)
+        oslot.meta.assignFrom(inputSlot.meta)
+        oslot.meta.shape = inputSlot.meta.shape[:-1] + (1,)
+        
+        inputtags = inputSlot.meta.axistags
+        assert inputtags.channelIndex == len(inputtags)-1, "FIXME: OpRgbToGrayscale assumes the channel index is last"
 
     def execute(self, slot, roi, result):
 

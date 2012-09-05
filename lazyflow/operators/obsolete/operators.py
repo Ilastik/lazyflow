@@ -45,9 +45,7 @@ class OpArrayPiper(Operator):
 
     def setupOutputs(self):
         inputSlot = self.inputs["Input"]
-        self.outputs["Output"].meta.dtype = inputSlot.meta.dtype
-        self.outputs["Output"].meta.shape = inputSlot.meta.shape
-        self.outputs["Output"].meta.axistags = copy.copy(inputSlot.meta.axistags)
+        self.outputs["Output"].meta.assignFrom(inputSlot.meta)
 
     def execute(self, slot, roi, result):
         key = roi.toSlice()
@@ -85,7 +83,7 @@ class OpMultiArrayPiper(Operator):
     inputSlots = [MultiInputSlot("MultiInput")]
     outputSlots = [MultiOutputSlot("MultiOutput")]
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         inputSlot = self.inputs["MultiInput"]
 
         self.outputs["MultiOutput"].resize(len(inputSlot)) #clearAllSlots()
@@ -129,7 +127,7 @@ class OpMultiMultiArrayPiper(Operator):
     inputSlots = [MultiInputSlot("MultiInput", level = 2)]
     outputSlots = [MultiOutputSlot("MultiOutput", level = 2)]
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         inputSlot = self.inputs["MultiInput"]
 
         self.outputs["MultiOutput"].resize(len(inputSlot)) #clearAllSlots()
@@ -246,6 +244,12 @@ class OpArrayCache(OpArrayPiper):
     logger = logging.getLogger(loggingName)
     traceLogger = logging.getLogger("TRACE." + loggingName)
 
+    # Block states
+    IN_PROCESS = 0
+    DIRTY = 1
+    CLEAN = 2
+    FIXED_DIRTY = 3
+
     def __init__(self, *args, **kwargs):
         with Tracer(self.traceLogger):
             super( OpArrayPiper, self ).__init__(*args, **kwargs)
@@ -261,6 +265,7 @@ class OpArrayCache(OpArrayPiper):
             self._lazyAlloc = True
             self._cacheHits = 0
             self.graph._registerCache(self)
+            self._has_fixed_dirty_blocks = False
 
     def _memorySize(self):
         if self._cache is not None:
@@ -285,7 +290,7 @@ class OpArrayCache(OpArrayPiper):
                         self.logger.debug("OpArrayCache: freed cache of shape:{}".format(fshape))
     
                     self._lock.acquire()
-                    self._blockState[:] = 1
+                    self._blockState[:] = OpArrayCache.DIRTY
                     del self._cache
                     self._cache = None
                     self._lock.release()
@@ -309,7 +314,7 @@ class OpArrayCache(OpArrayPiper):
             # if the entry in _dirtyArray differs from _dirtyState
             # the entry is considered dirty
             self._blockQuery = numpy.ndarray(self._dirtyShape, dtype=object)
-            self._blockState = numpy.ones(self._dirtyShape, numpy.uint8)
+            self._blockState = OpArrayCache.DIRTY * numpy.ones(self._dirtyShape, numpy.uint8)
     
             _blockNumbers = numpy.dstack(numpy.nonzero(self._blockState.ravel()))
             _blockNumbers.shape = self._dirtyShape
@@ -321,10 +326,8 @@ class OpArrayCache(OpArrayPiper):
     #        self._blockNumbers = _blockNumbers
     #        self._blockIndices = _blockIndices
     #
-                                #TODO: introduce constants for readability
-                                #0 is "in process"
-            self._blockState[:]= 1 #this is the dirty state
-            self._dirtyState = 2 #this is the clean state
+            self._blockState[:]= OpArrayCache.DIRTY
+            self._dirtyState = OpArrayCache.CLEAN
     
             # allocate queryArray object
             self._flatBlockIndices =  _blockIndices[:]
@@ -338,7 +341,7 @@ class OpArrayCache(OpArrayPiper):
             self._cacheLock.acquire()
     
             if self._cache is None or (self._cache.shape != self.shape):
-                mem = numpy.ndarray(self.shape, dtype = self.dtype)
+                mem = numpy.zeros(self.shape, dtype = self.dtype)
                 if lazyflow.verboseMemory:
                     self.logger.debug("OpArrayCache: Allocating cache (size: %dbytes)" % mem.nbytes)
                 self.graph._notifyMemoryAllocation(self, mem.nbytes)
@@ -374,20 +377,53 @@ class OpArrayCache(OpArrayPiper):
         if slot == self.inputs["Input"]:
             start, stop = sliceToRoi(key, self.shape)
 
-            self._lock.acquire()
-            if self._cache is not None:
-                blockStart = numpy.floor(1.0 * start / self._blockShape)
-                blockStop = numpy.ceil(1.0 * stop / self._blockShape)
-                blockKey = roiToSlice(blockStart,blockStop)
-                self._blockState[blockKey] = 1
-                #FIXME: we should recalculate results for which others are waiting and notify them...
-            self._lock.release()
+            with self._lock:
+                if self._cache is not None:
+                    blockStart = numpy.floor(1.0 * start / self._blockShape)
+                    blockStop = numpy.ceil(1.0 * stop / self._blockShape)
+                    blockKey = roiToSlice(blockStart,blockStop)
+                    if self._fixed:
+                        # If this block was clean before we became fixed and now it's dirty,
+                        #  mark it so we can notify downstream operators that this block is dirty once we become unfixed.
+                        # We only care about blocks that weren't already dirty (because the downstream operators were 
+                        #  already notified of any blocks that were dirty before we became fixed.)
+                        self._blockState[blockKey] = numpy.where(self._blockState[blockKey] != OpArrayCache.DIRTY, 
+                                                                 OpArrayCache.FIXED_DIRTY,
+                                                                 self._blockState[blockKey])
+                        self._has_fixed_dirty_blocks = True
+                    else:
+                        self._blockState[blockKey] = OpArrayCache.DIRTY
 
             if not self._fixed:
                 self.outputs["Output"].setDirty(key)
         if slot == self.inputs["fixAtCurrent"]:
-            if  self.inputs["fixAtCurrent"].ready():
-                self._fixed =  self.inputs["fixAtCurrent"].value
+            if self.inputs["fixAtCurrent"].ready():
+                self._fixed = self.inputs["fixAtCurrent"].value
+                if not self._fixed and self._cache is not None and self._has_fixed_dirty_blocks:
+                    # We've become unfixed, so we need to notify downstream 
+                    #  operators of every block that became dirty while we were fixed.
+                    # Convert all FIXED_DIRTY states into DIRTY states
+                    with self._lock:
+                        cond = (self._blockState[...] == OpArrayCache.FIXED_DIRTY)
+                        self._blockState[...]  = fastWhere(cond, OpArrayCache.DIRTY, self._blockState, numpy.uint8)
+                        self._has_fixed_dirty_blocks = False
+                    newDirtyBlocks = numpy.transpose(numpy.nonzero(cond))
+                    
+                    # To avoid lots of setDirty notifications, we simply merge all the dirtyblocks into one single superblock.
+                    # This should be the best option in most cases, but could be bad in some cases.
+                    # TODO: Optimize this by merging the dirty blocks via connected components or something.
+                    cacheShape = numpy.array(self._cache.shape)
+                    dirtyStart = cacheShape
+                    dirtyStop = [0] * len(cacheShape)
+                    for index in newDirtyBlocks:
+                        blockStart = index * self._blockShape
+                        blockStop = numpy.minimum(blockStart + self._blockShape, cacheShape)
+                        
+                        dirtyStart = numpy.minimum(dirtyStart, blockStart)
+                        dirtyStop = numpy.maximum(dirtyStop, blockStop)
+
+                    if len(newDirtyBlocks > 0):
+                        self.Output.setDirty( dirtyStart, dirtyStop )
 
     def execute(self,slot,roi,result):
         #return
@@ -417,14 +453,14 @@ class OpArrayCache(OpArrayPiper):
         # this is a little optimization to shortcut
         # many lines of python code when all data is
         # is already in the cache:
-        if (blockSet == 2).all():
+        if numpy.logical_or(blockSet == OpArrayCache.CLEAN, blockSet == OpArrayCache.FIXED_DIRTY).all():
             self._lock.release()
             result[:] = self._cache[roiToSlice(start, stop)]
             return
 
-        inProcessQueries = numpy.unique(numpy.extract( blockSet == 0, self._blockQuery[blockKey]))
+        inProcessQueries = numpy.unique(numpy.extract( blockSet == OpArrayCache.IN_PROCESS, self._blockQuery[blockKey]))
 
-        cond = (blockSet == 1)
+        cond = (blockSet == OpArrayCache.DIRTY)
         tileWeights = fastWhere(cond, 1, 128**3, numpy.uint32)
         trueDirtyIndices = numpy.nonzero(cond)
 
@@ -467,23 +503,25 @@ class OpArrayCache(OpArrayPiper):
                 self._blockQuery[key2] = req
 
                 #sanity check:
-                if (self._blockState[key2] != 1).any():
+                if (self._blockState[key2] != OpArrayCache.DIRTY).any():
                     print "original condition", cond
                     print "original tilearray", tileArray, tileArray.shape
                     print "original tileWeights", tileWeights, tileWeights.shape
-                    print "sub condition", self._blockState[key2] == 1
+                    print "sub condition", self._blockState[key2] == OpArrayCache.DIRTY
                     print "START, STOP", drStart2, drStop2
                     import h5py
                     f = h5py.File("test.h5", "w")
                     f.create_dataset("data",data = tileWeights)
                     print "%r \n %r \n %r\n %r\n %r \n%r" % (key2, blockKey,self._blockState[key2], self._blockState[blockKey][trueDirtyIndices],self._blockState[blockKey],tileWeights)
                     assert 1 == 2
-            else:
-                self._cache[key] = 0
-#        # indicate the inprocessing state, by setting array to 0
+        # indicate the inprocessing state, by setting array to 0 (i.e. IN_PROCESS)
         if not self._fixed:
-            blockSet[:]  = fastWhere(cond, 0, blockSet, numpy.uint8)
-
+            blockSet[:]  = fastWhere(cond, OpArrayCache.IN_PROCESS, blockSet, numpy.uint8)
+        else:
+            # Someone asked for some dirty blocks while we were fixed.
+            # Mark these blocks to be signaled as dirty when we become unfixed
+            blockSet[:]  = fastWhere(cond, OpArrayCache.FIXED_DIRTY, blockSet, numpy.uint8)
+            self._has_fixed_dirty_blocks = True
         self._lock.release()
 
         temp = itertools.count(0)
@@ -494,12 +532,11 @@ class OpArrayCache(OpArrayPiper):
             res = req.wait()
         self.traceLogger.debug( "All cache input requests received." )
 
-        # indicate the finished inprocess state
+        # indicate the finished inprocess state (i.e. CLEAN)
         if not self._fixed and temp.next() == 0:
-            self._lock.acquire()
-            blockSet[:] = fastWhere(cond, 2, blockSet, numpy.uint8)
-            self._blockQuery[blockKey] = fastWhere(cond, None, self._blockQuery[blockKey], object)
-            self._lock.release()
+            with self._lock:
+                blockSet[:] = fastWhere(cond, OpArrayCache.CLEAN, blockSet, numpy.uint8)
+                self._blockQuery[blockKey] = fastWhere(cond, None, self._blockQuery[blockKey], object)
 
 
         #wait for all in process queries
@@ -527,7 +564,7 @@ class OpArrayCache(OpArrayPiper):
             blockStop = numpy.where(stop == self.shape, self._dirtyShape, blockStop)
             blockKey = roiToSlice(blockStart,blockStop)
 
-            if (self._blockState[blockKey] != 2).any():
+            if (self._blockState[blockKey] != OpArrayCache.CLEAN).any():
                 start2 = blockStart * self._blockShape
                 stop2 = blockStop * self._blockShape
                 stop2 = numpy.minimum(stop2, self.shape)
@@ -616,7 +653,7 @@ if has_blist:
             self._oldShape = (0,)
             self._maxLabel = 0            
 
-        def notifyConnectAll(self):
+        def setupOutputs(self):
             if (self._oldShape != self.inputs["shape"].value).all():
                 shape = self.inputs["shape"].value
                 self._oldShape = shape
@@ -680,6 +717,13 @@ if has_blist:
             return result
 
         def setInSlot(self, slot, key, value):
+            assert value.dtype == self._denseArray.dtype, "Labels must be {}".format(self._denseArray.dtype)
+            assert isinstance(value, numpy.ndarray)            
+            if type(value) != numpy.ndarray:
+                # vigra.VigraArray doesn't handle advanced indexing correctly,
+                #   so convert to numpy.ndarray first
+                value = value.view(numpy.ndarray)
+            
             shape = self.inputs["shape"].value
             eraseLabel = self.inputs["eraser"].value
             neutralElement = 0
@@ -690,7 +734,7 @@ if has_blist:
             start = start.floor()
             stop = stop.floor()
 
-            tempKey = roiToSlice(start-start, stop-start, hardBind = True)
+            tempKey = roiToSlice(start-start, stop-start) #, hardBind = True)
 
             stop += numpy.where(stop-start == 0,1,0)
 
@@ -736,13 +780,23 @@ if has_blist:
                     self._sparseNZ.pop(index)
 
             # Update our maxlabel
-            self._maxLabel = numpy.where(valuesNZ != eraseLabel, valuesNZ, 0).max()
+            self._maxLabel = self._denseArray.max()
 
             self.lock.release()
 
             # Set our max label dirty if necessary
             self.outputs["maxLabel"].setValue(self._maxLabel)
             self.outputs["Output"].setDirty(key)
+        
+        def propagateDirty(self, inputSlot, roi):
+            if inputSlot == self.Input:
+                self.Output.setDirty(roi)
+            else:
+                # All other inputs are single-value inputs that will trigger
+                #  a new call to setupOutputs, which already sets the outputs dirty.
+                # (See above.) 
+                pass
+
 
     class OpBlockedSparseLabelArray(Operator):
         name = "Blocked Sparse Label Array"
@@ -774,6 +828,7 @@ if has_blist:
                 self._cacheShape = None
                 self._cacheEraser = None
                 self._maxLabel = 0
+                self.deleteLabel.setValue(-1)
     
         def setupOutputs(self):
             with Tracer(self.traceLogger):
@@ -949,7 +1004,8 @@ if has_blist:
                             self._labelers[b_ind]=OpSparseLabelArray(self)
                             self._labelers[b_ind].inputs["shape"].setValue(self._blockShape)
                             self._labelers[b_ind].inputs["eraser"].connect(self.inputs["eraser"])
-                            self._labelers[b_ind].inputs["deleteLabel"].connect(self.inputs["deleteLabel"])
+                            # Don't connect deletelabel; it is set manually (here and also above)
+                            self._labelers[b_ind].inputs["deleteLabel"].setValue(self.inputs["deleteLabel"].value)
                             
                             def updateMaxLabel(*args):
                                 maxLabel = 0
@@ -960,15 +1016,19 @@ if has_blist:
                                 self.outputs["maxLabel"].setValue( self._maxLabel )
                             
                             self._labelers[b_ind].outputs["maxLabel"].notifyDirty( updateMaxLabel )
+
+                            def handleDirtyLabelerOutput(slot, smallroi):
+                                bigroi = SubRegion(slot, start=offset + smallroi.start, stop=offset + smallroi.stop)
+                                self.Output.setDirty( bigroi )
+                            self._labelers[b_ind].outputs["Output"].notifyDirty( handleDirtyLabelerOutput )
     
-                        self._labelers[b_ind].inputs["Input"][smallkey] = smallvalues.squeeze()
+                        self._labelers[b_ind].inputs["Input"][smallkey] = smallvalues
     
                         # If necessary, update our max label using the labeler's max value
                         self._maxLabel = max( self._maxLabel, self._labelers[b_ind].outputs['maxLabel'].value )
     
                 # Set our max label output dirty
                 self.outputs["maxLabel"].setValue( self._maxLabel )
-                self.outputs["Output"].setDirty(key)
 
         def notifyDirty(self, slot, key):
             with Tracer(self.traceLogger):
@@ -992,8 +1052,9 @@ class OpBlockedArrayCache(Operator):
             self._configured = False
             self.source = OpArrayPiper(self)
             self.source.inputs["Input"].connect(self.inputs["Input"])
-            self.fixerSource = OpArrayPiper(self)
-            self.fixerSource.inputs["Input"].connect(self.inputs["fixAtCurrent"])
+            self._fixed = False
+            self._fixed_dirty_blocks = set()
+            self._lock = Lock()
 
     def setupOutputs(self):
         with Tracer(self.traceLogger):
@@ -1017,38 +1078,33 @@ class OpBlockedArrayCache(Operator):
                     self.Output.disconnect()
     
             if not self._configured:
-                self.outputs["Output"].meta.dtype = inputSlot.meta.dtype
-                self.outputs["Output"].meta.shape = inputSlot.meta.shape
-                self.outputs["Output"].meta.axistags = copy.copy(inputSlot.meta.axistags)
+                self.Output.meta.assignFrom(inputSlot.meta)
     
-                if not self._fixed:
-                    self._blockShape = self.inputs["outerBlockShape"].value
-                    self.shape = self.Input.meta.shape
-                    self._blockShape = tuple(numpy.minimum(self._blockShape, self.shape))
-                    assert numpy.array(self._blockShape).min() > 0, "ERROR in OpBlockedArrayCache: invalid blockShape = {blockShape}".format(blockShape=self._blockShape)
-                    self._dirtyShape = numpy.ceil(1.0 * numpy.array(self.shape) / numpy.array(self._blockShape))
-                    assert numpy.array(self._dirtyShape).min() > 0, "ERROR in OpBlockedArrayCache: invalid dirtyShape = {dirtyShape}".format(dirtyShape=self._dirtyShape)
-    
-                    self._blockState = numpy.ones(self._dirtyShape, numpy.uint8)
-    
-                    _blockNumbers = numpy.dstack(numpy.nonzero(self._blockState.ravel()))
-                    _blockNumbers.shape = self._dirtyShape
-    
-                    _blockIndices = numpy.dstack(numpy.nonzero(self._blockState))
-                    _blockIndices.shape = self._blockState.shape + (_blockIndices.shape[-1],)
-    
-                    self._blockNumbers = _blockNumbers
-    
-                    # allocate queryArray object
-                    self._flatBlockIndices =  _blockIndices[:]
-                    self._flatBlockIndices = self._flatBlockIndices.reshape(self._flatBlockIndices.size/self._flatBlockIndices.shape[-1],self._flatBlockIndices.shape[-1],)
-    
-                    self._opSub_list = {}
-                    self._cache_list = {}
-    
-                    self._lock = Lock()
-    
-                    self._configured = True
+                self.shape = self.Input.meta.shape
+                self._blockShape = self.inputs["outerBlockShape"].value
+                self._blockShape = tuple(numpy.minimum(self._blockShape, self.shape))
+                assert numpy.array(self._blockShape).min() > 0, "ERROR in OpBlockedArrayCache: invalid blockShape = {blockShape}".format(blockShape=self._blockShape)
+                self._dirtyShape = numpy.ceil(1.0 * numpy.array(self.shape) / numpy.array(self._blockShape))
+                assert numpy.array(self._dirtyShape).min() > 0, "ERROR in OpBlockedArrayCache: invalid dirtyShape = {dirtyShape}".format(dirtyShape=self._dirtyShape)
+
+                self._blockState = numpy.ones(self._dirtyShape, numpy.uint8)
+
+                _blockNumbers = numpy.dstack(numpy.nonzero(self._blockState.ravel()))
+                _blockNumbers.shape = self._dirtyShape
+
+                _blockIndices = numpy.dstack(numpy.nonzero(self._blockState))
+                _blockIndices.shape = self._blockState.shape + (_blockIndices.shape[-1],)
+
+                self._blockNumbers = _blockNumbers
+
+                # allocate queryArray object
+                self._flatBlockIndices =  _blockIndices[:]
+                self._flatBlockIndices = self._flatBlockIndices.reshape(self._flatBlockIndices.size/self._flatBlockIndices.shape[-1],self._flatBlockIndices.shape[-1],)
+
+                self._opSub_list = {}
+                self._cache_list = {}
+
+                self._configured = True
 
     def execute(self, slot, roi, result):
         with Tracer(self.traceLogger, msg='roi={}'.format(roi)):
@@ -1086,26 +1142,32 @@ class OpBlockedArrayCache(Operator):
                 smallkey = roiToSlice(smallstart, smallstop)
     
                 bigkey = roiToSlice(bigstart-start, bigstop-start)
-    
-                self._lock.acquire()
-    
-                if not self._fixed:
-                    if not self._cache_list.has_key(b_ind):
-                        self._opSub_list[b_ind] = generic.OpSubRegion(self)
-                        self._opSub_list[b_ind].inputs["Input"].connect(self.inputs["Input"])#source.outputs["Output"])
-    
-                        tstart = self._blockShape*self._flatBlockIndices[b_ind]
-                        tstop = numpy.minimum((self._flatBlockIndices[b_ind]+numpy.ones(self._flatBlockIndices[b_ind].shape, numpy.uint8))*self._blockShape, self.shape)
-    
-                        self._opSub_list[b_ind].inputs["Start"].setValue(tuple(tstart))
-                        self._opSub_list[b_ind].inputs["Stop"].setValue(tuple(tstop))
-    
-                        self._cache_list[b_ind] = OpArrayCache(self)
-                        self._cache_list[b_ind].inputs["Input"].connect(self._opSub_list[b_ind].outputs["Output"])
-                        #self._cache_list[b_ind].inputs["fixAtCurrent"].connect(self.fixerSource.outputs["Output"])
-                        self._cache_list[b_ind].inputs["fixAtCurrent"].setValue(False)
-                        self._cache_list[b_ind].inputs["blockShape"].setValue(self.inputs["innerBlockShape"].value)
-                self._lock.release()
+
+                with self._lock:    
+                    if not self._fixed:
+                        if not self._cache_list.has_key(b_ind):
+                            self._opSub_list[b_ind] = generic.OpSubRegion(self)
+                            self._opSub_list[b_ind].inputs["Input"].connect(self.inputs["Input"])#source.outputs["Output"])
+        
+                            tstart = self._blockShape*self._flatBlockIndices[b_ind]
+                            tstop = numpy.minimum((self._flatBlockIndices[b_ind]+numpy.ones(self._flatBlockIndices[b_ind].shape, numpy.uint8))*self._blockShape, self.shape)
+        
+                            self._opSub_list[b_ind].inputs["Start"].setValue(tuple(tstart))
+                            self._opSub_list[b_ind].inputs["Stop"].setValue(tuple(tstop))
+        
+                            self._cache_list[b_ind] = OpArrayCache(self)
+                            self._cache_list[b_ind].inputs["Input"].connect(self._opSub_list[b_ind].outputs["Output"])
+                            self._cache_list[b_ind].inputs["fixAtCurrent"].connect( self.fixAtCurrent )
+                            self._cache_list[b_ind].inputs["blockShape"].setValue(self.inputs["innerBlockShape"].value)
+                            
+                            # Forward dirtyness from inner caches to our output slot
+                            def handleDirtyBlock( slot, smallroi ):
+                                # Translate the block roi to a roi for our output
+                                bigroi = smallroi
+                                bigroi.start += offset
+                                bigroi.stop += offset
+                                self.Output.setDirty(bigroi.start, bigroi.stop)
+                            self._cache_list[b_ind].Output.notifyDirty( handleDirtyBlock )
     
                 if self._cache_list.has_key(b_ind):
                     op = self._cache_list[b_ind]
@@ -1121,6 +1183,11 @@ class OpBlockedArrayCache(Operator):
                     #value is fixed (fixAtCurrent=True), return 0  values
                     #This prevents random noise appearing in such cases.
                     result[bigkey] = 0
+                    with self._lock:
+                        # Since a downstream operator has expressed an interest in this block,
+                        #  mark it to be signaled as dirty when we become unfixed.
+                        # Otherwise, downstream operators won't know when there's valid data in this block.
+                        self._fixed_dirty_blocks.add(b_ind)
     
             for r in requests:
                 r.wait()
@@ -1128,8 +1195,46 @@ class OpBlockedArrayCache(Operator):
 
     def notifyDirty(self, slot, key):
         with Tracer(self.traceLogger):
-            if slot == self.inputs["Input"] and not self._fixed:
-                self.outputs["Output"].setDirty(key)
+            if slot == self.inputs["Input"]:
+                if not self._fixed:
+                    self.outputs["Output"].setDirty(key)                    
+                elif self._blockShape is not None:
+                    # Find the block key
+                    roi = SubRegion(slot, pslice=key)
+                    start, stop = roi.start, roi.stop
+            
+                    blockStart = (start / self._blockShape)
+                    blockStop = (stop * 1.0 / self._blockShape).ceil()
+                    blockKey = roiToSlice(blockStart,blockStop)
+                    innerBlocks = self._blockNumbers[blockKey]
+                    for b_ind in innerBlocks.flat:
+                        with self._lock:
+                            # Only need to remember this dirty block if we don't have a cache for it already
+                            # (Existing OpArrayCaches will propagate dirty keys on their own.)
+                            if not self._cache_list.has_key(b_ind):
+                                self._fixed_dirty_blocks.add(b_ind)            
+            if slot == self.fixAtCurrent:
+                self._fixed = self.fixAtCurrent.value
+                if not self._fixed:
+                    # We've become unfixed.
+                    # Take the superset of all the blocks that became dirty in the meantime and notify our output
+                    dirtystart, dirtystop = (None,None)
+                    with self._lock:
+                        if len(self._fixed_dirty_blocks) > 0:
+                            dirtystart = self.Output.meta.shape
+                            dirtystop = [0] * len(self.Output.meta.shape)
+                            for b_ind in self._fixed_dirty_blocks:
+                                offset = self._blockShape*self._flatBlockIndices[b_ind]
+                                bigstart = offset
+                                bigstop = numpy.minimum(offset + self._blockShape, self.Output.meta.shape)
+                                
+                                dirtystart = numpy.minimum(bigstart, dirtystart)
+                                dirtystop = numpy.maximum(bigstop, dirtystop)
+                            
+                            self._fixed_dirty_blocks = set()
+
+                    if dirtystart is not None:
+                        self.Output.setDirty(dirtystart, dirtystop)
 
     def setInSlot(self,slot,key):
         pass
@@ -1144,7 +1249,7 @@ class OpSlicedBlockedArrayCache(Operator):
     Input = InputSlot()
 
     inputSlots = [InputSlot("innerBlockShape"), InputSlot("outerBlockShape"), InputSlot("fixAtCurrent", value = False)]
-    outputSlots = [OutputSlot("Output")]
+    outputSlots = [OutputSlot("Output"), MultiOutputSlot("InnerOutputs")]
 
     loggerName = __name__ + ".OpSlicedBlockedArrayCache"
     logger = logging.getLogger(loggerName)
@@ -1153,72 +1258,105 @@ class OpSlicedBlockedArrayCache(Operator):
     def __init__(self, *args, **kwargs):
         with Tracer(self.traceLogger):
             super(OpSlicedBlockedArrayCache, self).__init__(*args, **kwargs)
-            self._lock = Lock()
             self._innerOps = []
 
     def setupOutputs(self):
-        with Tracer(self.traceLogger):
-            self.shape = self.inputs["Input"].shape
-            self._fixed = self.inputs["fixAtCurrent"].value
-            self._outerShapes = self.inputs["outerBlockShape"].value
-            self._innerShapes = self.inputs["innerBlockShape"].value
-    
-            if len(self._innerShapes) != len(self._innerOps):
-                for o in self._innerOps:
-                    o.disconnect()
-    
-                self._innerOps = []
-    
-                for i,innershape in enumerate(self._innerShapes):
-                    op = OpBlockedArrayCache(self)
-                    op.inputs["fixAtCurrent"].connect(self.inputs["fixAtCurrent"])
-                    op.inputs["Input"].connect(self.inputs["Input"])
-                    self._innerOps.append(op)
-    
-            for i,innershape in enumerate(self._innerShapes):
-                op = self._innerOps[i]
-                op.inputs["innerBlockShape"].setValue(innershape)
-                op.inputs["outerBlockShape"].setValue(self._outerShapes[i])
-    
-            self.outputs["Output"].meta.dtype = self.inputs["Input"].meta.dtype
-            self.outputs["Output"].meta.axistags = copy.copy(self.inputs["Input"].meta.axistags)
-            self.outputs["Output"].meta.shape = self.inputs["Input"].meta.shape
+        self.shape = self.inputs["Input"].shape
+        self._outerShapes = self.inputs["outerBlockShape"].value
+        self._innerShapes = self.inputs["innerBlockShape"].value
 
+        if len(self._innerShapes) != len(self._innerOps):
+            for o in self._innerOps:
+                o.disconnect()
+
+            self._innerOps = []
+
+            for i,innershape in enumerate(self._innerShapes):
+                op = OpBlockedArrayCache(self)
+                op.inputs["fixAtCurrent"].connect(self.inputs["fixAtCurrent"])
+                op.inputs["Input"].connect(self.inputs["Input"])
+                self._innerOps.append(op)
+
+                # Forward dirty propagations from all three inputs to our output.
+                def handleDirty( slot, roi ):
+                    self.Output.setDirty( roi.start, roi.stop )
+                op.Output.notifyDirty( handleDirty )
+
+        for i,innershape in enumerate(self._innerShapes):
+            op = self._innerOps[i]
+            op.inputs["innerBlockShape"].setValue(innershape)
+            op.inputs["outerBlockShape"].setValue(self._outerShapes[i])
+
+        self.Output.meta.assignFrom(self.Input.meta)
+
+        # We also provide direct access to each of our inner cache outputs.        
+        self.InnerOutputs.resize( len(self._innerOps) )
+        for i, slot in enumerate(self.InnerOutputs):
+            slot.connect(self._innerOps[i].Output)
 
     def execute(self, slot, roi, result):
-        with Tracer(self.traceLogger):
-            key = roi.toSlice()
-            start,stop=sliceToRoi(key,self.shape)
-            diff=numpy.array(stop)-numpy.array(start)
-    
-            maxError=sys.maxint
-            index=0
-    
-            self._lock.acquire()
-            for i,shape in enumerate(self._innerShapes):
-                cs = numpy.array(shape)
-    
-                error = numpy.sum(numpy.abs(diff -cs))
-                if error<maxError:
-                    index = i
-                    maxError = error
-            op = self._innerOps[index]
-            #print "Selected index %d with shape=%r for diff=%r, key=%r" %(index, self._innerShapes[index], diff, key)
-            self._lock.release()
-    
-            op.outputs["Output"][key].writeInto(result).wait()
+        assert slot == self.Output
+        
+        key = roi.toSlice()
+        start,stop=sliceToRoi(key,self.shape)
+        roishape=numpy.array(stop)-numpy.array(start)
+
+        max_dist_squared=sys.maxint
+        index=0
+
+        for i,blockshape in enumerate(self._innerShapes):
+            blockshape = numpy.array(blockshape)
+
+            diff = roishape - blockshape
+            diffsquared = diff * diff
+            distance_squared = numpy.sum(diffsquared)
+            if distance_squared < max_dist_squared:
+                index = i
+                max_dist_squared = distance_squared
+
+        op = self._innerOps[index]
+        op.outputs["Output"][key].writeInto(result).wait()
 
     def notifyDirty(self, slot, key):
-        with Tracer(self.traceLogger):
-            if slot == self.inputs["Input"] and not self._fixed:
-                self.outputs["Output"].setDirty(key)
-            if slot == self.inputs["fixAtCurrent"]:
-                if self.inputs["fixAtCurrent"].ready():
-                    self._fixed =  self.inputs["fixAtCurrent"].value
-                else:
-                    # Should always be ready, no?
-                    assert False
-
-
-    def setInSlot(self,slot,key):
+        # Dirtiness is automatically forwarded from our inner operators to our output.
+        # FIXME: This means that every dirty roi gets propagated three times.
         pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

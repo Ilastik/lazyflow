@@ -61,11 +61,22 @@ class OpStreamingHdf5Reader(Operator):
         self.OutputImage.meta.shape = dataset.shape
         self.OutputImage.meta.axistags = axistags
 
+        # If the dataset specifies a datarange, add it to the slot metadata
+        if 'drange' in hdf5File[internalPath].attrs:
+            self.OutputImage.meta.drange = tuple( hdf5File[internalPath].attrs['drange'] )
+
     def execute(self, slot, roi, result):
         # Read the desired data directly from the hdf5File
         key = roi.toSlice()
         hdf5File = self.Hdf5File.value
         internalPath = self.InternalPath.value
+        
+        # On windows, internalPath may have backslashes, so replace them with forward slashes.
+        internalPath = internalPath.replace('\\', '/')
 
         # Access the data
         result[...] = hdf5File[internalPath][key]
+
+    def propagateDirty(self, slot, roi):
+        if slot == self.Hdf5File or slot == self.InternalPath:
+            self.OutputImage.setDirty( slice(None) )

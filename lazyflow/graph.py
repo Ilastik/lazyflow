@@ -47,6 +47,7 @@ import types
 import itertools
 import threading
 import logging
+import warnings
 
 from h5dumprestore import instanceClassToString, stringToClass
 from helpers import itersubclasses, detectCPUs, deprecated, warn_deprecated
@@ -442,6 +443,7 @@ class Slot(object):
                 self.disconnect()
     
             if partner is not None:
+                self._value = None
                 if partner.level == self.level:
                     self.partner = partner
                     notifyReady = self.partner.meta._ready and not self.meta._ready
@@ -783,6 +785,9 @@ class Slot(object):
             for p in self.partners:
                 p[key] = value
 
+    def index(self, slot):
+        return self._subSlots.index(slot)
+
     def setInSlot(self, slot, key, value):
         """
         For now, Slots of level > 0 pretend to be operators (as far as their subslots are concerned).
@@ -819,7 +824,12 @@ class Slot(object):
         if isinstance(temp, numpy.ndarray) and temp.shape != (1,):
             return temp
         else:
-            return temp[0]
+            try:
+                return temp[0]
+            except IndexError:
+                w = "FIXME: Slot.value for slot {} is {}, which should be wrapped in an ndarray.".format(self.name, temp)
+                self.logger.warn(w)
+                return temp
 
     def setValue(self, value, notify = True, check_changed = True):
         """
@@ -835,6 +845,13 @@ class Slot(object):
 
         """
         with Tracer(self.traceLogger):
+            assert isinstance( notify, bool )
+            assert isinstance( check_changed, bool )
+            
+            # This assertion is here to prevent accidental use of setValue when connect should be used.
+            # If your use case requires passing slots as values, then this assertion can be refined.
+            assert not isinstance(value, Slot), "When using setValue, value cannot be a slot.  Use connect instead."
+
             changed = True
             try:
                 if check_changed and value == self._value:
@@ -1496,7 +1513,7 @@ class Operator(object):
 
     def _setDefaultInputValues(self):
         for i in self.inputs.values():
-            if i._value is None and i._defaultValue is not None:
+            if i.partner is None and i._value is None and i._defaultValue is not None:
                 i.setValue(i._defaultValue)
 
     def _getOriginalOperator(self):
@@ -1522,20 +1539,19 @@ class Operator(object):
     outputslots.
     """
     def propagateDirty(self, inputSlot, roi):
-#        with Tracer(self.traceLogger, msg=self.name):
-            # default implementation calls old api for backwardcompatability
-            if hasattr(roi,"toSlice"):
-                self.notifyDirty(inputSlot,roi.toSlice())
-            else:
-                self.logger.debug("propagateDirty: roi={}".format(roi))
-                raise TypeError(".propagatedirty of Operator %r is not implemented !" % (self))
+        # default implementation calls old api for backwardcompatability
+        if hasattr(roi,"toSlice"):
+            self.notifyDirty(inputSlot,roi.toSlice())
+        else:
+            self.logger.debug("propagateDirty: roi={}".format(roi))
+            raise TypeError(".propagatedirty of Operator %r is not implemented !" % (self))
 
     def notifyDirty(self, inputSlot, key):
-#        with Tracer(self.traceLogger, msg=self.name):
-            # simple default implementation
-            # -> set all outputs dirty
-            for os in self.outputs.values():
-                os.setDirty(slice(None,None,None))
+        # simple default implementation
+        # -> set all outputs dirty
+        warnings.warn( "Operator '{}' implements neither notifyDirty nor propagateDirty.".format(self.name) )
+        for os in self.outputs.values():
+            os.setDirty(slice(None,None,None))
 
     """
     This method corresponds to the notifyDirty method, but is used
@@ -1555,6 +1571,7 @@ class Operator(object):
     def notifySubSlotDirty(self, slots, indexes, key):
         # simple default implementation
         # -> set all outputs dirty
+        warnings.warn( "Operator '{}' does not implement notifySubSlotDirty.".format(self.name) )
         for os in self.outputs.values():
             os.setDirty(slice(None,None,None))
 
@@ -1563,9 +1580,6 @@ class Operator(object):
 
     def _notifyConnect(self, inputSlot):
         pass#self.notifyConnect(inputSlot)
-
-    def _notifyConnectAll(self):
-        pass
 
     def _setupOutputs(self):
         with Tracer(self.traceLogger, msg=self.name):
@@ -1645,24 +1659,7 @@ class Operator(object):
 
         The default implementation emulates the old api behaviour.
         """
-        with Tracer(self.traceLogger):
-            # emulate old behaviour
-            self.notifyConnectAll()
-
-
-
-    """
-    OBSOLETE API
-    This method is called opon connection of all inputslots of
-    an operator.
-
-    The operator should setup the output all outputslots accordingly.
-    this includes setting their shape and axistags properties.
-    """
-    def notifyConnectAll(self):
         pass
-
-
 
     """
     This method of the operator is called when a connected operator

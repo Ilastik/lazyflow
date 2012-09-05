@@ -83,7 +83,7 @@ class OpMultiArraySlicer(Operator):
     name = "Multi Array Slicer"
     category = "Misc"
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
 
         dtype=self.inputs["Input"].dtype
         flag=self.inputs["AxisFlag"].value
@@ -147,6 +147,10 @@ class OpMultiArraySlicer2(Operator):
     name = "Multi Array Slicer"
     category = "Misc"
 
+    def __init__(self, *args, **kwargs):
+        super(OpMultiArraySlicer2, self).__init__(*args, **kwargs)
+        self.inputShape = None
+
     def setupOutputs(self):
         dtype=self.inputs["Input"].meta.dtype
         flag=self.inputs["AxisFlag"].value
@@ -171,14 +175,11 @@ class OpMultiArraySlicer2(Operator):
             o.meta.axistags = outaxistags
             o.meta.shape = outshape
 
-        # If our input slot changes shape, we need to set up again        
-        self.Input.notifyMetaChanged(self.handleInputMetaChanged)
-        
-    def handleInputMetaChanged(self, *args):
-        # Note that we're calling the underscore version here so that changes are propagated to our partners
-        # FIXME: There should be a more straightforward way of doing this...
-        if self.configured():
-            self._setupOutputs()
+        inputShape = self.Input.meta.shape
+        if self.inputShape != inputShape:
+            self.inputShape = inputShape
+            for i in range(n):
+                self.Slices[i].setDirty(slice(None))
 
     def getSubOutSlot(self, slots, indexes, key, result):
 
@@ -206,6 +207,25 @@ class OpMultiArraySlicer2(Operator):
         ttt = self.inputs["Input"][newKey].allocate().wait()
         result[:]=ttt[:]
 
+    def propagateDirty(self, inputSlot, roi):
+        if inputSlot == self.AxisFlag:
+            # AxisFlag changed.  Everything is dirty
+            for i, slot in enumerate(self.Slices):
+                slot.setDirty(slice(None))
+        elif inputSlot == self.Input:
+            # Mark each of the intersected slices as dirty
+            channelAxis = self.Input.meta.axistags.index('c')
+            channels = zip(roi.start, roi.stop)[channelAxis]
+            for i in range(*channels):
+                if i < len(self.Slices):
+                    slot = self.Slices[i]
+                    sliceRoi = copy.copy(roi)
+                    sliceRoi.start[channelAxis] = 0
+                    sliceRoi.stop[channelAxis] = 1
+                    slot.setDirty(sliceRoi)
+        else:
+            assert False, "Unknown dirty input slot."
+
 class OpMultiArrayStacker(Operator):
     inputSlots = [MultiInputSlot("Images"), InputSlot("AxisFlag"), InputSlot("AxisIndex")]
     outputSlots = [OutputSlot("Output")]
@@ -214,7 +234,7 @@ class OpMultiArrayStacker(Operator):
     description = "Stack inputs on any axis, including the ones which are not there yet"
     category = "Misc"
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         #This function is needed so that we don't depend on the order of connections.
         #If axis flag or axis index is connected after the input images, the shape is calculated
         #here
@@ -309,6 +329,11 @@ class OpMultiArrayStacker(Operator):
         for r in requests:
             r.wait()
 
+    def propagateDirty(self, inputSlot, roi):
+        if inputSlot == self.AxisFlag or inputSlot == self.AxisIndex:
+            self.Output.setDirty( slice(None) )
+        else:
+            assert False, "Unknown input slot."
 
 
 class OpSingleChannelSelector(Operator):
@@ -318,15 +343,16 @@ class OpSingleChannelSelector(Operator):
     inputSlots = [InputSlot("Input"),InputSlot("Index",stype='integer')]
     outputSlots = [OutputSlot("Output")]
 
-    def notifyConnectAll(self):
-        self.outputs["Output"]._dtype =self.inputs["Input"].dtype
-        self.outputs["Output"]._shape = self.inputs["Input"].shape[:-1]+(1,)
-        self.outputs["Output"]._axistags = self.inputs["Input"].axistags
+    def setupOutputs(self):
+        inputtags = self.Input.meta.axistags
+        assert inputtags.channelIndex == len(inputtags)-1, "FIXME: OpSingleChannelSelector assumes the channel axis is last."
+
+        self.Output.meta.assignFrom(self.Input.meta)
+        self.Output.meta.shape = self.Input.meta.shape[:-1]+(1,)
 
     def getOutSlot(self, slot, key, result):
 
         index=self.inputs["Index"].value
-        #FIXME: check the axistags for a multichannel image
         assert self.inputs["Input"].shape[-1] > index, ("Requested channel, %d, is out of Range" % index)
 
         # Only ask for the channel we need
@@ -353,7 +379,7 @@ class OpSubRegion(Operator):
     inputSlots = [InputSlot("Input"), InputSlot("Start"), InputSlot("Stop")]
     outputSlots = [OutputSlot("Output")]
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         with Tracer(traceLogger):
             start = self.inputs["Start"].value
             stop = self.inputs["Stop"].value
@@ -369,10 +395,9 @@ class OpSubRegion(Operator):
             for e in temp:
                 if e > 0:
                     outShape = outShape + (e,)
-        
-            self.outputs["Output"]._shape = outShape
-            self.outputs["Output"]._axistags = self.inputs["Input"].axistags
-            self.outputs["Output"]._dtype = self.inputs["Input"].dtype
+
+            self.Output.meta.assignFrom(self.Input.meta)
+            self.Output.meta.shape = outShape        
 
     def getOutSlot(self, slot, key, resultArea):
         with Tracer(traceLogger):
@@ -406,8 +431,20 @@ class OpSubRegion(Operator):
             res = self.inputs["Input"][newKey].allocate().wait()
             resultArea[:] = res[resultKey]
 
+    def propagateDirty(self, dirtySlot, roi):
+        if dirtySlot == self.Input:
+            # Translate the input key to a small subregion key
+            smallstart = roi.start - self.Start.value
+            smallstop = roi.stop - self.Start.value
+            
+            # Clip to our output shape
+            smallstart = numpy.maximum(smallstart, 0)
+            smallstop = numpy.minimum(smallstop, self.Output.meta.shape)
 
-
+            # If there's an intersection with our output,
+            #  propagate dirty region to output
+            if ((smallstop - smallstart ) > 0).all():
+                self.Output.setDirty( smallstart, smallstop )
 
 class OpMultiArrayMerger(Operator):
     inputSlots = [MultiInputSlot("Inputs"),InputSlot('MergingFunction')]
@@ -416,7 +453,7 @@ class OpMultiArrayMerger(Operator):
     name = "Merge Multi Arrays based on a variadic merging function"
     category = "Misc"
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
 
         shape=self.inputs["Inputs"][0].shape
         axistags=copy.copy(self.inputs["Inputs"][0].axistags)
@@ -457,8 +494,7 @@ class OpPixelOperator(Operator):
     inputSlots = [InputSlot("Input"), InputSlot("Function")]
     outputSlots = [OutputSlot("Output")]
 
-    def notifyConnectAll(self):
-
+    def setupOutputs(self):
         inputSlot = self.inputs["Input"]
 
         self.function = self.inputs["Function"].value
@@ -467,18 +503,13 @@ class OpPixelOperator(Operator):
         self.outputs["Output"]._dtype = inputSlot.dtype
         self.outputs["Output"]._axistags = inputSlot.axistags
 
-
-
     def getOutSlot(self, slot, key, result):
-
-
         matrix = self.inputs["Input"][key].allocate().wait()
         matrix = self.function(matrix)
 
         result[:] = matrix[:]
 
-
-    def notifyDirty(selfut,slot,key):
+    def notifyDirty(self,slot,key):
         self.outputs["Output"].setDirty(key)
 
     @property
@@ -575,6 +606,10 @@ class OpMultiInputConcatenater(Operator):
         # Should never be called.  All output slots are directly connected to an input slot.
         assert False
 
+    def notifySubSlotDirty(self, slots, indexes, key):
+        # Nothing to do here.
+        # All outputs are directly connected to an input slot.
+        pass
 
 class OpTransposeSlots(Operator):
     """
@@ -602,6 +637,11 @@ class OpTransposeSlots(Operator):
         # Should never be called.  All output slots are directly connected to an input slot.
         assert False
 
+    def notifySubSlotDirty(self, slots, indexes, key):
+        # Nothing to do here.
+        # All outputs are directly connected to an input slot.
+        pass
+        
 
 
 

@@ -9,9 +9,10 @@ class TestOpInputDataReader(object):
     @classmethod
     def setupClass(cls):
         cls.graph = lazyflow.graph.Graph()
-        cls.testNpyDataFileName = 'test.npy'
-        cls.testImageFileName = 'test.png'
-        cls.testH5FileName = 'test.h5'
+        localdir = os.path.split(__file__)[0]
+        cls.testNpyDataFileName = localdir + '/test.npy'
+        cls.testImageFileName = localdir + '/test.png'
+        cls.testH5FileName = localdir + '/test.h5'
 
     @classmethod
     def teardownClass(cls):
@@ -92,5 +93,8 @@ class TestOpInputDataReader(object):
                     assert h5Data[0,0,k,l,m] == k + l + m
 
 if __name__ == "__main__":
+    import sys
     import nose
-    nose.main(defaultTest=__file__)
+    sys.argv.append("--nocapture")    # Don't steal stdout.  Show it on the console as usual.
+    sys.argv.append("--nologcapture") # Don't set the logging level to DEBUG.  Leave it alone.
+    nose.run(defaultTest=__file__)

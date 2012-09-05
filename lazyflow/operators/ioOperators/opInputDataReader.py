@@ -1,5 +1,5 @@
 from lazyflow.graph import Operator, InputSlot, OutputSlot
-from lazyflow.operators import OpImageReader
+from lazyflow.operators import OpImageReader, OpArrayCache
 from opStreamingHdf5Reader import OpStreamingHdf5Reader
 from opNpyFileReader import OpNpyFileReader
 from lazyflow.operators.ioOperators import OpStackLoader
@@ -15,6 +15,11 @@ class OpInputDataReader(Operator):
     """
     name = "OpInputDataReader"
     category = "Input"
+
+    h5Exts = ['h5', 'hdf5']
+    npyExts = ['npy']
+    imageExts = vigra.impex.listExtensions().split()
+    SupportedExtensions = h5Exts + npyExts + imageExts
 
     # FilePath is inspected to determine data type.
     # For hdf5 files, append the internal path to the filepath,
@@ -63,7 +68,8 @@ class OpInputDataReader(Operator):
         # If we still haven't found a matching file type
         if self.internalOperator is None:
             # Check for an hdf5 extension
-            h5Exts = ['.h5', '.hdf5', '.ilp']
+            h5Exts = self.h5Exts + ['ilp']
+            h5Exts = ['.' + ex for ex in h5Exts]
             ext = None
             for x in h5Exts:
                 if x in filePath:
@@ -94,7 +100,7 @@ class OpInputDataReader(Operator):
             fileExtension = fileExtension.lstrip('.') # Remove leading dot
 
             # Check for numpy extension
-            if fileExtension == 'npy':
+            if fileExtension in self.npyExts:
                 # Create an internal operator
                 npyReader = OpNpyFileReader(graph=self.graph)
                 npyReader.FileName.setValue(filePath)
@@ -104,8 +110,15 @@ class OpInputDataReader(Operator):
             elif fileExtension in vigra.impex.listExtensions().split():
                 vigraReader = OpImageReader(graph=self.graph)
                 vigraReader.Filename.setValue(filePath)
-                self.internalOperator = vigraReader
-                self.internalOutput = vigraReader.Image
+
+                # Cache the image instead of reading the hard disk for every access.
+                imageCache = OpArrayCache( graph=self.graph )
+                imageCache.Input.connect(vigraReader.Image)
+                imageCache.blockShape.setValue( vigraReader.Image.meta.shape ) # Just one block for the whole image
+                assert imageCache.Output.ready()
+                
+                self.internalOperator = imageCache
+                self.internalOutput = imageCache.Output
 
         assert self.internalOutput is not None, "Can't read " + filePath + " because it has an unrecognized format."
 
@@ -114,3 +127,7 @@ class OpInputDataReader(Operator):
 
     def execute(self, slot, roi, result):
         assert False, "Shouldn't get here because our output is directly connected..."
+
+    def propagateDirty(self, inputSlot, roi):
+        # Output slots are directly conncted to internal operators
+        pass

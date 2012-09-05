@@ -22,7 +22,7 @@ class OpFlipArrayShifter(Operator):
     inputSlots = [InputSlot("Input"), InputSlot("Shift")]
     outputSlots = [OutputSlot("Output")]
 
-    def notifyConnectAll(self):
+    def setupOutputs(self):
         #new name for the InputSlot("Input")
         inputSlot = self.inputs["Input"]
         #the value of inputs["Shift"].value, (the value of InputSlot("Shift))
@@ -177,7 +177,7 @@ if __name__ == "__main__":
 
     #connect Shifter-Input with Image Reader Output
     #because the Operator has only one Input Slot in this example,
-    #the "notifyConnectAll" method is executed
+    #the "setupOutputs" method is executed
     shifter.inputs["Input"].connect(vimageReader.outputs["Image"])
 
     #shifter.outputs["Output"][:]returns an "GetItemWriterObject" object.
