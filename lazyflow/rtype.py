@@ -46,8 +46,9 @@ class SubRegion(Roi):
         remove the i'th dimension from the SubRegion
         works inplace !
         """
-        self.start.pop(dim)
-        self.stop.pop(dim)
+        if dim is not None:
+            self.start.pop(dim)
+            self.stop.pop(dim)
         return self
 
     def setDim(self, dim , start, stop):
@@ -70,21 +71,27 @@ class SubRegion(Roi):
         return self
         
 
-    def expandByShape(self,shape):
+    def expandByShape(self,shape,cIndex):
         """
         extend a roi by a given in shape
         """
         #TODO: Warn if bounds are exceeded
+        cStart = self.start[cIndex]
+        cStop = self.stop[cIndex]
         if type(shape == int):
             tmp = shape
             shape = numpy.zeros(self.dim).astype(int)
             shape[:] = tmp
-        tmpStart = [x-s for x,s in zip(self.start,shape)]
-        tmpStop = [x+s for x,s in zip(self.stop,shape)]
-        self.start = TinyVector([max(t,i) for t,i in zip(tmpStart,numpy.zeros_like(self.inputShape))])
-        self.stop = TinyVector([min(t,i) for t,i in zip(tmpStop,self.inputShape)])
+        
+        tmpStart = [int(x-s) for x,s in zip(self.start,shape)]
+        tmpStop = [int(x+s) for x,s in zip(self.stop,shape)]
+        start = [int(max(t,i)) for t,i in zip(tmpStart,numpy.zeros_like(self.inputShape))]   
+        stop = [int(min(t,i)) for t,i in zip(tmpStop,self.inputShape)]
+        start[cIndex] = cStart
+        stop[cIndex] = cStop
+        self.start = TinyVector(start)
+        self.stop = TinyVector(stop)
         return self
-
         
     def centerIn(self,shape):
         difference = [int(((shape-(stop-start))/2.0)) for (shape,start),stop in zip(zip(shape,self.start),self.stop)]  
@@ -92,19 +99,13 @@ class SubRegion(Roi):
         self.start = TinyVector(difference)
         self.stop = TinyVector([diff+dim for diff,dim in zip(difference,dimension)])
         return self
-    
-    def setStartToZero(self):
-        start = [0]*len(self.start)
-        stop = [end-begin for begin,end in zip(self.start,self.stop)]
-        self.start = TinyVector(start)
-        self.stop = TinyVector(stop)
-        return self
-    
-    def maskWithShape(self,shape):
-        start = [a for a,b in zip(self.start,list(shape))]
-        stop = [b for a,b in zip(self.stop,list(shape))]
-        self.start = start
-        self.stop = stop
+
+    def adjustChannel(self,cPerC,cIndex):
+        if cPerC != 1:
+            start = [self.start[i]/cPerC if i == cIndex else self.start[i] for i in range(len(self.start))]
+            stop = [self.stop[i]/cPerC+1 if i==cIndex else self.stop[i] for i in range(len(self.stop))]
+            self.start = TinyVector(start)
+            self.stop = TinyVector(stop)
         return self
 
     def toSlice(self, hardBind = False):
