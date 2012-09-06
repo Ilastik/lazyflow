@@ -1,10 +1,12 @@
 from lazyflow.graph import Operator,InputSlot,OutputSlot
-from lazyflow.helpers import AxisIterator
+from lazyflow.helpers import AxisIterator, newIterator
 from lazyflow.operators.obsolete.generic import OpMultiArrayStacker
 from lazyflow.operators.obsolete.vigraOperators import Op50ToMulti
-import numpy,vigra
+import numpy
+import vigra
 from math import sqrt
 from functools import partial
+from lazyflow.roi import roiToSlice, sliceToRoi
 
 class OpBaseVigraFilter(Operator):
     
@@ -27,6 +29,14 @@ class OpBaseVigraFilter(Operator):
     def setupFilter(self):
         pass
     
+    def propagateDirty(self,slot,roi):
+        if slot == self.inputs["Input"]:
+            cIndex = self.inputs["Input"].axistags.channelIndex
+            retRoi = roi.copy()
+            retRoi.start[cIndex] *= self.channelsPerChannel()
+            retRoi.stop[cIndex] *= self.channelsPerChannel()
+            self.outputs["Output"].setDirty(retRoi)
+    
     def setupIterator(self,source,result):
         self.iterator = AxisIterator(source,'spatialc',result,'spatialc',[(),(1,1,1,1,self.resultingChannels())])
     
@@ -41,21 +51,30 @@ class OpBaseVigraFilter(Operator):
     def execute(self,slot,roi,result):
         axistags = self.inputs["Input"].axistags
         inputShape  = self.inputs["Input"].shape
-        #Set up roi 
+        channelIndex = axistags.index('c')
+        channelsPerC = self.channelsPerChannel()
+        #vigra returns a value even if time is not part of the axistags
+        timeIndex = axistags.index('t')
+        if timeIndex >= roi.dim:
+            timeIndex = None
+        origRoi = roi.copy()
+        #Set up roi
         roi.setInputShape(inputShape)
-        #setup filter ONLY WHEN SIGMAS ARE SET and get MaxSigma for 
+        #setup filter ONLY WHEN SIGMAS ARE SET and get maxSigma  
         sigma = self.setupFilter()
-        #get srcRoi to retrieve neccessary sourcedata
-        srcRoi = roi.expandByShape(sigma*self.windowSize)
-        source = self.inputs["Input"](srcRoi.start,srcRoi.stop).wait()
+        #set up roi to retrieve necessary source data
+        roi.expandByShape(sigma*self.windowSize,channelIndex).adjustChannel(channelsPerC,channelIndex)
+        source = self.inputs["Input"](roi.start,roi.stop).wait()
         source = vigra.VigraArray(source,axistags=axistags)
-        #Setup iterator to meet the special needs of each filter
-        self.setupIterator(source, result)
-        #get vigraRois to work with vigra filter
-        vigraRoi = roi.centerIn(source.shape).popAxis('ct')
-        for srckey,trgtkey in self.iterator:
-            mask = roi.setStartToZero().maskWithShape(result[trgtkey].shape).toSlice()
-            result[trgtkey] = self.vigraFilter(source=source[srckey],roi=vigraRoi)[mask]
+        srcGrid = [source.shape[i] if i!= channelIndex else 1 for i in range(len(source.shape))]
+        trgtGrid = [inputShape[i]  if i != channelIndex else self.channelsPerChannel() for i in range(len(source.shape))]
+        #vigra cant handle time (easily) 
+        if timeIndex is not None:
+            srcGrid[timeIndex] = 1
+            trgtGrid[timeIndex] = 1
+        nIt = newIterator(origRoi,srcGrid,trgtGrid,timeIndex=timeIndex,channelIndex = channelIndex,halo = sigma,style = 'lazyflow')
+        for src,trgt,mask in nIt:
+            result[trgt] = self.vigraFilter(source = source[src])[mask]
         return result
     
 class OpGaussianSmoothing(OpBaseVigraFilter):
@@ -72,10 +91,10 @@ class OpGaussianSmoothing(OpBaseVigraFilter):
     def setupFilter(self):
         sigma = self.inputs["Sigma"].value
         
-        def tmpFilter(source,sigma,roi):
+        def tmpFilter(source,sigma):
             tmpfilter = vigra.filters.gaussianSmoothing
-            return tmpfilter(array=source,sigma=sigma,roi=(roi.start,roi.stop))
-
+            return tmpfilter(array=source,sigma=sigma)
+    
         self.vigraFilter = partial(tmpFilter,sigma=sigma)
         return sigma
         
@@ -84,6 +103,32 @@ class OpGaussianSmoothing(OpBaseVigraFilter):
     
     def channelsPerChannel(self):
         return 1
+    
+class OpDifferenceOfGaussians(OpBaseVigraFilter):
+    inputSlots = [InputSlot("Input"), InputSlot("Sigma", stype = "float"), InputSlot("Sigma2", stype = "float")]
+    name = "DifferenceOfGaussians"
+    
+    def __init__(self,parent):
+        OpBaseVigraFilter.__init__(self,parent)
+        self.vigraFilter = None
+        
+    def setupFilter(self):
+        sigma0 = self.inputs["Sigma"].value
+        sigma1 = self.inputs["Sigma2"].value
+        
+        def tmpFilter(s0,s1,source):
+            tmpfilter = vigra.filters.gaussianSmoothing
+            return tmpfilter(source,s0)-tmpfilter(source,s1)
+        
+        self.vigraFilter = partial(tmpFilter,s0=sigma0,s1=sigma1)
+        return max(sigma0,sigma1)
+    
+    def resultingChannels(self):
+        return self.inputs["Input"].meta.shape[self.inputs["Input"].meta.axistags.index('c')]
+    
+    def channelsPerChannel(self):
+        return 1
+
         
 class OpHessianOfGaussian(OpBaseVigraFilter):
     inputSlots = [InputSlot("Input"),InputSlot("Sigma")]
@@ -99,12 +144,12 @@ class OpHessianOfGaussian(OpBaseVigraFilter):
     def setupFilter(self):
         sigma = self.inputs["Sigma"].value
         
-        def tmpFilter(source,sigma,roi):
+        def tmpFilter(source,sigma):
             tmpfilter = vigra.filters.hessianOfGaussian
             if source.axistags.axisTypeCount(vigra.AxisType.Space) == 2:
-                return tmpfilter(image=source,sigma=sigma,roi=(roi.start,roi.stop))
+                return tmpfilter(image=source,sigma=sigma)
             elif source.axistags.axisTypeCount(vigra.AxisType.Space) == 3:
-                return tmpfilter(volume=source,sigma=sigma,roi=(roi.start,roi.stop))
+                return tmpfilter(volume=source,sigma=sigma)
             
         self.vigraFilter = partial(tmpFilter,sigma=sigma)
         return sigma
@@ -114,32 +159,6 @@ class OpHessianOfGaussian(OpBaseVigraFilter):
     
     def channelsPerChannel(self):
         return self.inputs["Input"].axistags.axisTypeCount(vigra.AxisType.Space)*(self.inputs["Input"].axistags.axisTypeCount(vigra.AxisType.Space) + 1) / 2
-    
-class OpDifferenceOfGaussians(OpBaseVigraFilter):
-    inputSlots = [InputSlot("Input"), InputSlot("Sigma", stype = "float"), InputSlot("Sigma2", stype = "float")]
-    name = "DifferenceOfGaussians"
-    
-    def __init__(self,parent):
-        OpBaseVigraFilter.__init__(self,parent)
-        self.vigraFilter = None
-        
-    def setupFilter(self):
-        sigma0 = self.inputs["Sigma"].value
-        sigma1 = self.inputs["Sigma2"].value
-        
-        def tmpFilter(s0,s1,source,roi):
-            tmpfilter = vigra.filters.gaussianSmoothing
-            return tmpfilter(source,s0,roi=(roi.start,roi.stop))-tmpfilter(source,s1,roi=(roi.start,roi.stop))
-
-        self.vigraFilter = partial(tmpFilter,s0=sigma0,s1=sigma1)
-        
-        return max(sigma0,sigma1)
-    
-    def resultingChannels(self):
-        return self.inputs["Input"].meta.shape[self.inputs["Input"].meta.axistags.index('c')]
-    
-    def channelsPerChannel(self):
-        return 1
     
 class OpLaplacianOfGaussian(OpBaseVigraFilter):
     inputSlots = [InputSlot("Input"), InputSlot("Sigma", stype = "float")]
@@ -152,9 +171,9 @@ class OpLaplacianOfGaussian(OpBaseVigraFilter):
     def setupFilter(self):
         scale = self.inputs["Sigma"].value
         
-        def tmpFilter(source,scale,roi):
+        def tmpFilter(source,scale):
             tmpfilter = vigra.filters.laplacianOfGaussian
-            return tmpfilter(array=source,scale=scale,roi=(roi.start,roi.stop))
+            return tmpfilter(array=source,scale=scale)
 
         self.vigraFilter = partial(tmpFilter,scale=scale)
 
@@ -162,6 +181,9 @@ class OpLaplacianOfGaussian(OpBaseVigraFilter):
     
     def resultingChannels(self):
         return self.inputs["Input"].meta.shape[self.inputs["Input"].meta.axistags.index('c')]
+    
+    def channelsPerChannel(self):
+        return 1
 
 class OpStructureTensorEigenvalues(OpBaseVigraFilter):
     inputSlots = [InputSlot("Input"), InputSlot("Sigma", stype = "float"),InputSlot("Sigma2", stype = "float")]
@@ -175,9 +197,9 @@ class OpStructureTensorEigenvalues(OpBaseVigraFilter):
         innerScale = self.inputs["Sigma2"].value
         outerScale = self.inputs["Sigma"].value
         
-        def tmpFilter(source,innerScale,outerScale,roi):
+        def tmpFilter(source,innerScale,outerScale):
             tmpfilter = vigra.filters.structureTensorEigenvalues
-            return tmpfilter(image=source,innerScale=innerScale,outerScale=outerScale,roi=(roi.start,roi.stop))
+            return tmpfilter(image=source,innerScale=innerScale,outerScale=outerScale)
 
         self.vigraFilter = partial(tmpFilter,innerScale=innerScale,outerScale=outerScale)
 
@@ -203,9 +225,9 @@ class OpHessianOfGaussianEigenvalues(OpBaseVigraFilter):
     def setupFilter(self):
         scale = self.inputs["Sigma"].value
         
-        def tmpFilter(source,scale,roi):
+        def tmpFilter(source,scale):
             tmpfilter = vigra.filters.hessianOfGaussianEigenvalues
-            return tmpfilter(image=source,scale=scale,roi=(roi.start,roi.stop))
+            return tmpfilter(image=source,scale=scale)
 
         self.vigraFilter = partial(tmpFilter,scale=scale)
         
@@ -231,15 +253,18 @@ class OpGaussianGradientMagnitude(OpBaseVigraFilter):
     def setupFilter(self):
         sigma = self.inputs["Sigma"].value
                 
-        def tmpFilter(source,sigma,roi):
+        def tmpFilter(source,sigma):
             tmpfilter = vigra.filters.gaussianGradientMagnitude
-            return tmpfilter(source,sigma=sigma,roi=(roi.start,roi.stop))
+            return tmpfilter(source,sigma=sigma)
 
         self.vigraFilter = partial(tmpFilter,sigma=sigma)
         return sigma
 
     def resultingChannels(self):
         return self.inputs["Input"].meta.shape[self.inputs["Input"].meta.axistags.index('c')]
+    
+    def channelsPerChannel(self):
+        return 1
     
 
 class OpPixelFeaturesPresmoothed(Operator):
@@ -259,6 +284,32 @@ class OpPixelFeaturesPresmoothed(Operator):
         self.operatorList = [OpGaussianSmoothing,OpLaplacianOfGaussian,\
                         OpStructureTensorEigenvalues,OpHessianOfGaussianEigenvalues,\
                         OpGaussianGradientMagnitude,OpDifferenceOfGaussians]
+    
+    def propagateDirty(self,slot,roi):
+        #this isn't tested yet. test it
+        if slot == self.inputs["Input"]:
+            cIndex = self.inputs["Input"].axistags.channelIndex
+            inMatrix = self.inputs["Matrix"].value
+            usedOperators = [reduce(lambda x,y: x or y,operator,False) for operator in inMatrix]
+            cCount = 0
+            opInstances = []
+            #make this a instance variable
+            scaleMultiplyList = [False,False,0.5,False,False,0.66]
+            for i in range(len(self.operatorList)):
+                op = self.operatorList[i](self.graph)
+                op.inputs["Input"].connect(self.inputs["Input"])
+                op.inputs["Sigma"].setValue(1.0)#dummy
+                if scaleMultiplyList[i]:
+                    op.inputs["Sigma2"].setValue(2.0)#dummy
+                opInstances.append(op)
+                
+            for i in range(len(usedOperators)):
+                if usedOperators[i]:
+                    roiCopy = roi.copy()
+                    roiCopy.start[cIndex] = cCount + roi.start[cIndex]*opInstances[i].channelsPerChannel()
+                    roiCopy.stop[cIndex] = cCount + roi.stop[cIndex]*opInstances[i].channelsPerChannel()
+                    self.outputs["Output"].setDirty(roiCopy)
+                cCount += (roi.stop[cIndex]-roi.start[cIndex])*opInstances[i].channelsPerChannel()
         
     def setupOutputs(self):
         
@@ -323,13 +374,13 @@ class OpPixelFeaturesPresmoothed(Operator):
         #Get axistags and inputShape
         axistags = self.inputs["Input"].axistags
         inputShape  = self.inputs["Input"].shape
-        resultCIndex = self.outputs["Output"].axistags.channelIndex
+        cIndex = self.outputs["Output"].axistags.channelIndex
         
         #Set up roi 
         roi.setInputShape(inputShape)
 
         #Request Required Region
-        srcRoi = roi.expandByShape(self.maxSigma*self.windowSize)
+        srcRoi = roi.expandByShape(self.maxSigma*self.windowSize,cIndex)
         source = self.inputs["Input"](srcRoi.start,srcRoi.stop).wait()
         
         #disconnect all operators
@@ -345,7 +396,7 @@ class OpPixelFeaturesPresmoothed(Operator):
                     opM[sig][op].inputs["Input"].setValue(source)
                     cIndex = opM[sig][op].outputs["Output"].axistags.channelIndex
                     cSize  = opM[sig][op].outputs["Output"].shape[cIndex]
-                    slicing = [slice(0,result.shape[i],None) if i != resultCIndex \
+                    slicing = [slice(0,result.shape[i],None) if i != cIndex \
                                else slice(cIter,cIter+cSize,None) for i in \
                                range(len(result.shape))]
                     result[slicing] = opM[sig][op].outputs["Output"]().wait()
@@ -357,9 +408,12 @@ import vigra
 
 if __name__ == "__main__":
     
-    v = vigra.VigraArray((20,20,10))
+    v = vigra.VigraArray((100,100,100))
     g = Graph()
-    op = OpHessianOfGaussianEigenvalues(g)
-    op.inputs["Sigma"].setValue(2.0)
+    op = OpGaussianSmoothing(g)
     op.inputs["Input"].setValue(v)
-    print op.outputs["Output"]().wait().shape
+    op.inputs["Sigma"].setValue(1.0)
+    op.outputs["Output"]([1,1,1],[7,7,4]).wait()  
+                
+                
+        

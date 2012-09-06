@@ -1,6 +1,6 @@
-import os,numpy,itertools
+import os,numpy,itertools,copy
 from lazyflow.config import CONFIG
-from lazyflow.roi import TinyVector
+from lazyflow.roi import TinyVector, roiToSlice
 
 def warn_deprecated( msg ):
     warn = True
@@ -118,9 +118,9 @@ class AxisIterator:
     """
     An Iterator Class that iterates over slices of a source and a destination
     array. sourceAxis and destinationAxis specify the volume which is iterated
-    over. Transform specifies the ratio between the source and destinaton slices.  
+    over. Transform specifies the ratio between the source and destination slices.  
     """
-    def __init__(self, source, sourceAxis, destination, destinationAxis, transform,destinationTags=None):
+    def __init__(self, source, sourceAxis, destination, destinationAxis, transform, roi = None, destinationTags=None):
         self.source = source
         self.dest = destination
         self.sourceAxisDict,self.revSourceAxisDict = self.createAxisDicts(source)
@@ -133,6 +133,7 @@ class AxisIterator:
         self.destAxis = self.axisStringParser(destinationAxis)
         self.transform = [self.transformParser(transform[0],self.sourceAxisDict),\
                           self.transformParser(transform[1],self.destAxisDict)]
+        self.roi = roi
         self.setupIterSpace()
 
     def transformParser(self,transform,axisDict):
@@ -170,7 +171,17 @@ class AxisIterator:
         return self.iterSpace.__iter__()
 
     def setupIterSpace(self):
-        def getSlicing(shape, string,revAxDic, transform = None):
+        
+        def restrictToRoi(iterSpace,roi):
+            for k in iterSpace:
+                trgtroi = ([key.start for key in k[1]],[key.stop for key in k[1]])
+                if  not reduce(lambda x,y: x or y, map(lambda x,y: True if x>y else False,roi[0],trgtroi[0]),False):
+                   print roi[0]
+                   print trgtroi[0]
+                   iterSpace.remove(k)
+
+
+        def getSlicing(shape, string, revAxDic, transform = None):
             slicing = []
             mask = []
             for i in range(len(shape)):
@@ -191,9 +202,146 @@ class AxisIterator:
                             sl.append(s[c])
                         c += 1
                     else:
-                        sl.append(slice(0, None, None))
+                        sl.append(slice(0, shape[i], None))
                 slicing.append(sl)
             return slicing
         
         self.iterSpace = zip(getSlicing(self.source.shape, self.sourceAxis,self.revSourceAxisDict,self.transform[0]),\
                              getSlicing(self.dest.shape, self.destAxis,self.revDestAxisDict,self.transform[1]))
+        
+        restrictToRoi(self.iterSpace, self.roi)
+        
+
+class newIterator:
+    def __init__(self,roi,srcGrid,trgtGrid,timeIndex = None,channelIndex = None,halo = 0,style = None):
+        #cast list due to TinyVector being strange
+        self.style = style
+        self.roi = (list(roi.start),list(roi.stop))
+        self.srcGrid = srcGrid
+        self.trgtGrid = trgtGrid
+        self.halo = halo
+        self.cIndex = channelIndex
+        if timeIndex is not None:
+            self.hardBind = [timeIndex]
+        else:
+            self.hardBind = []
+            
+
+    def nextStop(self,start,grid,roi):
+        mult = [b/l for b,l in zip(start,grid)]
+        gridStop = [(m+1)*l for m,l in zip(mult,grid)]
+        roiStop = roi[1]
+        nextStop = [min(a,b) for a,b in zip(gridStop,roiStop)] 
+        if reduce(lambda x,y: x or y, map(lambda x,y: True if x==y else False,roiStop,start),False):
+            return None
+        else:
+            return nextStop
+        
+    def nextStarts(self,point,grid,roi):
+        nextPoint = self.nextStop(point,grid,roi)
+        nextStarts = []
+        if nextPoint:
+            for j in range(len(nextPoint)):
+                p = copy.copy(point)
+                p[j] = nextPoint[j]
+                nextStarts.append(p)
+            nextStarts.append(nextPoint)
+        return nextStarts
+    
+    def getSubRois(self,point,grid,roi):
+        starts = [point]
+        visited = []
+        subRois = []
+        while len(starts):
+            start = starts.pop()
+            visited.append(start)
+            nextStop = self.nextStop(start,grid,roi)
+            if nextStop:
+                subRois.append((start,nextStop))
+            for s in self.nextStarts(start,grid,roi):
+                if not s in visited:
+                    starts.append(s)
+        return subRois
+    
+    def getMask(self,subRoi,grid):
+        start0 = subRoi[0]
+        stop0 = subRoi[1]
+        #set edges for halo
+        startEdgeIndeces = [i for i in range(len(start0)) if (start0[i] == self.roi[0][i] and i != self.cIndex)]
+        #maybe obsolete
+        #stopEdgeIndeces = [i for i in range(len(stop0)) if (stop0[i] == self.roi[1][i]and i != self.cIndex)]
+        #case function inflates source
+        start1 = [start0[i]%grid[i] for i in range(len(start0))]
+        stop1 = [stop0[i]%grid[i] if stop0[i]%grid[i] != 0 else grid[i] for i in range(len(stop0))]
+        #case grid > roi
+        start2 = [start1[i] if grid[i]<stop0[i] else 0 for i in range(len(start1))]
+        stop2 = [stop1[i] if grid[i]<stop0[i] else stop1[i]-start1[i] for i in range(len(stop1))]
+        #apply halo
+        halo = [self.halo]*len(start0)
+        if self.style == "lazyflow":
+            for i in startEdgeIndeces:
+                halo[i] = min(self.halo,self.roi[0][i],grid[i]-self.roi[1][i])
+        for i in startEdgeIndeces:
+            start2[i] = halo[i]
+            stop2[i] += halo[i]
+        start = start2
+        stop = stop2
+        for i in self.hardBind:
+            start.pop(i)
+            stop.pop(i)
+        return (start,stop)
+                
+    def mapRoiToSource(self,subRoi,srcGrid=None,trgtGrid=None):
+        start = subRoi[0]
+        stop = subRoi[1]
+        if srcGrid is None:
+            srcGrid = self.srcGrid
+        if trgtGrid is None:
+            trgtGrid = self.trgtGrid
+        start = [start[i]/trgtGrid[i]*srcGrid[i] for i in range(len(start))]
+        stop = [start[i]+srcGrid[i] for i in range(len(stop))]
+        return (start,stop)
+    
+    def translateRoi(self,subRoi,point):
+        start = subRoi[0]
+        stop = subRoi[1]
+        start = [start[i] - point[i] for i in range(len(start))]
+        stop = [stop[i] - point[i] for i in range(len(start))]
+        return (start,stop)
+    
+    def toSlice(self,roi,hardBind=False):
+        start = roi[0]
+        stop = roi[1]
+        rTsl1 = lambda x,y:slice(x.__int__(),y.__int__())
+        if self.hardBind and hardBind:
+            res = []
+            zipL = zip(start,stop)
+            for i in range(len(zipL)):
+                if (zipL[i][1] == zipL[i][0] + 1 or zipL[i][1] == zipL[i][0]) and i in self.hardBind:
+                    res.append(int(zipL[i][0]))
+                else:
+                    res.append(slice(int(zipL[i][0]),int(zipL[i][1])))
+            return tuple(res)
+        else:
+            return tuple(map(rTsl1,start,stop))
+    
+    def __iter__(self):
+        trgtRois = self.getSubRois(self.roi[0], self.trgtGrid, self.roi)
+        srcRoi = self.mapRoiToSource(self.roi)
+        retRoi = [(self.translateRoi(self.mapRoiToSource(roi),srcRoi[0]),\
+                 self.translateRoi(roi,self.roi[0]),self.getMask(roi,self.trgtGrid))\
+                for roi in trgtRois]
+        retSlice = [(self.toSlice(src,True),self.toSlice(trgt,True),self.toSlice(mask)) \
+                    for src,trgt,mask in retRoi]
+        return retSlice.__iter__()
+ 
+if __name__ == "__main__":
+    
+    class roi:
+        def __init__(self,start,stop):
+            self.start = start
+            self.stop = stop
+    r = roi([3,2],[9,10])
+    nIt = newIterator(r,[10,1],[12,3],halo=2)
+    for i,j,k in nIt:
+        print i

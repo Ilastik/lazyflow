@@ -1,7 +1,7 @@
 from lazyflow.operators.imgFilterOperators import OpPixelFeaturesPresmoothed
 from lazyflow.graph import Graph
 from unittest import TestCase
-import numpy,random
+import numpy,random,vigra
 
 class testOpPixelFeaturesPreesmoothed(TestCase):
     
@@ -38,7 +38,7 @@ class testOpPixelFeaturesPreesmoothed(TestCase):
             self.operator.outputs["Output"]().wait()
                 
     def test4Dimension(self):
-        fourDimVol = self.testVol
+        fourDimVol = vigra.VigraArray(self.testVol,axistags=vigra.defaultAxistags('txyzc'))
         for i in range(0,6):
             self.setupMatrixAndScales()
             self.operator.inputs["Input"].setValue(fourDimVol)
