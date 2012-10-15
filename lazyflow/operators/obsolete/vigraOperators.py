@@ -1,18 +1,18 @@
 import numpy, vigra, h5py
 import traceback
-from lazyflow.graph import *
-import gc
+from lazyflow.graph import Operator, InputSlot, OutputSlot, OrderedSignal
 from lazyflow import roi
 from lazyflow.roi import sliceToRoi
 import copy
-from lazyflow.request import Pool, Request
+from lazyflow.request import Pool
 
-from functools import partial
-
-from operators import OpArrayPiper, OpMultiArrayPiper
+from operators import OpArrayPiper
 from lazyflow.rtype import SubRegion
 
-from generic import OpMultiArrayStacker, getSubKeyWithFlags, popFlagsFromTheKey
+import os
+from collections import deque
+
+from generic import OpMultiArrayStacker, popFlagsFromTheKey
 
 import math
 
@@ -32,7 +32,7 @@ class OpXToMulti(Operator):
     def setupOutputs(self):
         length = 0
         for slot in self.inputs.values():
-            if slot.connected():
+            if slot.ready():
                 length += 1
 
         self.outputs["Outputs"].resize(length)
@@ -40,7 +40,7 @@ class OpXToMulti(Operator):
         i = 0
         for sname in sorted(self.inputs.keys()):
             slot = self.inputs[sname]
-            if slot.connected():
+            if slot.ready():
                 self.outputs["Outputs"][i].meta.assignFrom( slot.meta )
                 i += 1
 
@@ -50,7 +50,7 @@ class OpXToMulti(Operator):
         i = 0
         for sname in sorted(self.inputs.keys()):
             slot = self.inputs[sname]
-            if slot.connected():
+            if slot.ready():
                 if i == index:
                     return slot[key].allocate().wait()
                 i += 1
@@ -62,10 +62,13 @@ class OpXToMulti(Operator):
             if slot == islot:
                 self.outputs["Outputs"][i].setDirty(roi)
                 break
-            if slot.connected():
+            if slot.ready():
                 self.outputs["Outputs"][i].meta.assignFrom( slot.meta )
                 i += 1
 
+    def setInSlot(self, slot, subindex, roi, value):
+        # Nothing to do here: All inputs are directly connected to an input slot.
+        pass
 
 class Op1ToMulti(OpXToMulti):
     name = "1 Element to Multislot"
@@ -141,12 +144,12 @@ class OpPixelFeaturesPresmoothed(Operator):
 
     def __init__(self, *args, **kwargs):
         Operator.__init__(self, *args, **kwargs)
-        self.source = OpArrayPiper(self)
+        self.source = OpArrayPiper(parent=self)
         self.source.inputs["Input"].connect(self.inputs["Input"])
 
-        self.stacker = OpMultiArrayStacker(self)
+        self.stacker = OpMultiArrayStacker(parent=self)
 
-        self.multi = Op50ToMulti(self)
+        self.multi = Op50ToMulti(parent=self)
 
         self.stacker.inputs["Images"].connect(self.multi.outputs["Outputs"])
 
@@ -265,7 +268,7 @@ class OpPixelFeaturesPresmoothed(Operator):
             
             #additional connection with FakeOperator
             if (self.matrix==0).all():
-                fakeOp = OpGaussianSmoothing(self)
+                fakeOp = OpGaussianSmoothing(parent=self)
                 fakeOp.inputs["Input"].connect(self.source.outputs["Output"])
                 fakeOp.inputs["sigma"].setValue(10)
                 self.multi.inputs["Input%02d" %(i*dimCol+j+1)].connect(fakeOp.outputs["Output"])
@@ -1065,12 +1068,23 @@ class OpH5Reader(Operator):
     inputSlots = [InputSlot("Filename", stype = "filestring"), InputSlot("hdf5Path", stype = "string")]
     outputSlots = [OutputSlot("Image")]
 
+    def __init__(self, *args, **kwargs):
+        super(OpH5Reader, self).__init__(*args, **kwargs)
+        self._file = None
+
+    def cleanUp(self):
+        super(OpH5Reader, self).cleanUp()
+        self._file.close()
 
     def setupOutputs(self):
         filename = self.inputs["Filename"].value
         hdf5Path = self.inputs["hdf5Path"].value
 
+        if self._file is not None:
+            self._file.close()
+            
         f = h5py.File(filename, 'r')
+        self.file = f
 
         d = f[hdf5Path]
 
@@ -1265,7 +1279,10 @@ class OpH5WriterBigDataset(Operator):
         chunkShape = numpy.asarray(self.chunkShape)
 
         # Choose a request shape that is a multiple of the chunk shape
-        shift = chunkShape * numpy.array([10,2,2,2,10])
+        axistags = self.Image.meta.axistags
+        multipliers = { 'x':2, 'y':2, 'z':2, 't':1, 'c':10 }
+        multiplier = [multipliers[tag.key] for tag in axistags ]
+        shift = chunkShape * numpy.array(multiplier)
         shift=numpy.minimum(shift,shape)
         start=numpy.asarray([0]*len(shape))
 
@@ -1298,10 +1315,18 @@ class OpH5ReaderBigDataset(Operator):
     inputSlots = [InputSlot("Filenames"), InputSlot("hdf5Path", stype = "string")]
     outputSlots = [OutputSlot("Output")]
 
-    def __init__(self, parent):
-        Operator.__init__(self, parent)
-
+    def __init__(self, parent=None, graph=None):
+        Operator.__init__(self, parent=parent, graph=graph)
         self._lock = Lock()
+        self._file = None
+        
+        assert False, "Don't use this operator without rewriting it to make sense.  In particular, make it track it's files better.  Why not just use OpStreamingHdf5Reader instead?  That would probably be better...."
+
+    def cleanUp(self):
+        super(self, OpH5ReaderBigDataset).cleanUp()
+        self._file.close()
+        for f in self.F:
+            f.close()
 
     def setupOutputs(self):
         filename = str(self.inputs["Filenames"].value[0])
@@ -1309,8 +1334,13 @@ class OpH5ReaderBigDataset(Operator):
         # On windows, there may be backslashes.
         hdf5Path = hdf5Path.replace('\\', '/')
 
-        f = h5py.File(filename, 'r')
+        if self._file is not None:
+            self._file.close()
 
+        if self._file == None:
+            self._file = h5py.File(filename, 'r')
+
+        f = self._file
         d = f[hdf5Path]
 
         self.shape=d.shape
@@ -1391,6 +1421,9 @@ class OpH5ReaderSmoothedDataset(Operator):
     inputSlots = [InputSlot("Filenames"), InputSlot("hdf5Path", stype = "string")]
     outputSlots = [OutputSlot("Outputs", level=1),OutputSlot("Sigmas", level=1)]
 
+    def __init__(self, *args, **kwargs):
+        super(OpH5ReaderSmoothedDataset, self).__init__(*args, **kwargs)
+        assert False, "FIXME: Fix this operator to manage its resources properly via cleanUp()"
 
     def setupOutputs(self):
 

@@ -622,10 +622,10 @@ class OpArrayCache(OpArrayPiper):
                     print "sub condition", self._blockState[key2] == OpArrayCache.DIRTY
                     print "START, STOP", drStart2, drStop2
                     import h5py
-                    f = h5py.File("test.h5", "w")
-                    f.create_dataset("data",data = tileWeights)
-                    print "%r \n %r \n %r\n %r\n %r \n%r" % (key2, blockKey,self._blockState[key2], self._blockState[blockKey][trueDirtyIndices],self._blockState[blockKey],tileWeights)
-                    assert 1 == 2
+                    with h5py.File("test.h5", "w") as f:
+                        f.create_dataset("data",data = tileWeights)
+                        print "%r \n %r \n %r\n %r\n %r \n%r" % (key2, blockKey,self._blockState[key2], self._blockState[blockKey][trueDirtyIndices],self._blockState[blockKey],tileWeights)
+                    assert False
                 self._blockState[key2] = OpArrayCache.IN_PROCESS
 
         # indicate the inprocessing state, by setting array to 0 (i.e. IN_PROCESS)
@@ -769,7 +769,7 @@ if has_blist:
             self._maxLabel = 0            
 
         def setupOutputs(self):
-            if (self._oldShape != self.inputs["shape"].value).all():
+            if (self._oldShape != self.inputs["shape"].value).any():
                 shape = self.inputs["shape"].value
                 self._oldShape = shape
                 self.outputs["Output"].meta.dtype = numpy.uint8
@@ -916,10 +916,36 @@ if has_blist:
 
 
     class OpBlockedSparseLabelArray(Operator):
+        """
+        This operator is designed to provide sparse access to label data.
+        
+        Inputs:
+            Input - Must be connected to a slot whose axistags are correct for the data being stored.
+                    The partner will NOT be used for obtaining label data.  It will just be used to get the axistags.
+                    Client code uses setitem syntax with this input to insert new labels into the array.
+                    e.g. op.Input[0:1,10:20,20:30,30:40,0:1] = mydata[0:1,0:10,0:10,0:10,0:1]
+            shape - The shape of the overall data array
+            eraser - The value that represents the eraser label.  If this label is seen in data that 
+                     comes in via setInSlot(), then the labels at these points will be deleted (reset to zero).
+            deleteLabel - A "special" input that is monitored for TRANSITIONS.  
+                         When it transitions from -1 to some label value N, label value N is deleted from the array.  
+                         All other labels > N are decremented afterwards, so the stored labels are always in a continuous sequence.
+                         For example, if the array already has values for labels 1, 2, and 3, setting deleteLabel to 2 
+                         will cause all 2s to be deleted, and then the 3s are converted to 2s.  
+                         The end result is a stored array that contains label values for 1 and 2.
+            blockShape - The shape of the internal blocks used to store (sparsely) the label values in the array
+        
+        Outputs:
+            Output - The stored values.  Any data that has not been marked with a label yet will be given as zeros.
+            nonzeroValues - The list of label values (e.g. [1,2,3])
+            nonzeroCoordinates - NOT SUPPORTED
+            nonzeroBlocks - A list of slicings that will yield non-zero data if queried on the Output slot
+            maxLabel - The maximum label value currently stored anywhere in the array.
+        """
         name = "Blocked Sparse Label Array"
         description = "simple cache for sparse label arrays"
 
-        inputSlots = [InputSlot("Input", optional = True),
+        inputSlots = [InputSlot("Input"),
                       InputSlot("shape"),
                       InputSlot("eraser"),
                       InputSlot("deleteLabel", optional = True),
@@ -964,7 +990,7 @@ if has_blist:
     
                     self.outputs["Output"].meta.dtype = numpy.uint8
                     self.outputs["Output"].meta.shape = self._cacheShape
-                    self.outputs["Output"].meta.axistags = vigra.defaultAxistags(len(self._cacheShape)) # Default if no input tags
+                    self.outputs["Output"].meta.axistags = self.Input.meta.axistags
     
                     # Copy axis tags from input if possible
                     inputAxisTags = self.inputs["Input"].meta.axistags
@@ -1030,72 +1056,71 @@ if has_blist:
                         l.inputs["deleteLabel"].setValue(self.inputs['deleteLabel'].value)
 
         def execute(self, slot, subindex, roi, result):
-            with Tracer(self.traceLogger):
-                key = roi.toSlice()
-                self.lock.acquire()
-                assert(self.inputs["eraser"].ready() == True and self.inputs["shape"].ready() == True and self.inputs["blockShape"].ready()==True), \
-                "OpBlockedSparseLabelArray:  One of the neccessary input slots is not ready: shape: %r, eraser: %r" % \
-                (self.inputs["eraser"].ready(), self.inputs["shape"].ready())
-                if slot.name == "Output":
-                        #result[:] = self._denseArray[key]
-                        #find the block key
-                    start, stop = sliceToRoi(key, self._cacheShape)
-                    blockStart = (1.0 * start / self._blockShape).floor()
-                    blockStop = (1.0 * stop / self._blockShape).ceil()
-                    blockKey = roiToSlice(blockStart,blockStop)
-                    innerBlocks = self._blockNumbers[blockKey]
-                    if lazyflow.verboseRequests:
-                        print "OpBlockedSparseLabelArray %r: request with key %r for %d inner Blocks " % (self,key, len(innerBlocks.ravel()))
-                    for b_ind in innerBlocks.ravel():
-                        #which part of the original key does this block fill?
-                        offset = self._blockShape*self._flatBlockIndices[b_ind]
-                        bigstart = numpy.maximum(offset, start)
-                        bigstop = numpy.minimum(offset + self._blockShape, stop)
-    
-                        smallstart = bigstart-offset
-                        smallstop = bigstop - offset
-    
-                        bigkey = roiToSlice(bigstart-start, bigstop-start)
-                        smallkey = roiToSlice(smallstart, smallstop)
-                        if not b_ind in self._labelers or not self._labelers[b_ind].Output.ready():
-                            result[bigkey]=0
-                        else:
-                            try:
-                                labeler = self._labelers[b_ind]
-                                denseArray = labeler._denseArray[smallkey]
-                                result[bigkey]= denseArray
-                            except:
-                                print "Exception in OpBlockedSparseLabelArray.execute, probably due to simultaneous calls to setInSlot() and execute()"
-                                print "labeler =", labeler
-                                print "denseArray =", denseArray
-                                print "result =", result
-                                raise
-    
-                elif slot.name == "nonzeroValues":
-                    nzvalues = set()
-                    for l in self._labelers.values():
-                        nzvalues |= set(l._sparseNZ.values())
-                    result[0] = numpy.array(list(nzvalues))
-    
-                elif slot.name == "nonzeroCoordinates":
-                    print "not supported yet"
-                    #result[0] = numpy.array(self._sparseNZ.keys())
-                elif slot.name == "nonzeroBlocks":
-                    #we only return all non-zero blocks, no keys
-                    slicelist = []
-                    for b_ind in self._labelers.keys():
-                        offset = self._blockShape*self._flatBlockIndices[b_ind]
-                        bigstart = offset
-                        bigstop = numpy.minimum(offset + self._blockShape, self._cacheShape)
-                        bigkey = roiToSlice(bigstart, bigstop)
-                        slicelist.append(bigkey)
-    
-                    result[0] = slicelist
-                elif slot.name == "maxLabel":
-                    result[0] = self._maxLabel
-    
-                self.lock.release()
-                return result
+            key = roi.toSlice()
+            self.lock.acquire()
+            assert(self.inputs["eraser"].ready() == True and self.inputs["shape"].ready() == True and self.inputs["blockShape"].ready()==True), \
+            "OpBlockedSparseLabelArray:  One of the neccessary input slots is not ready: shape: %r, eraser: %r" % \
+            (self.inputs["eraser"].ready(), self.inputs["shape"].ready())
+            if slot.name == "Output":
+                    #result[:] = self._denseArray[key]
+                    #find the block key
+                start, stop = sliceToRoi(key, self._cacheShape)
+                blockStart = (1.0 * start / self._blockShape).floor()
+                blockStop = (1.0 * stop / self._blockShape).ceil()
+                blockKey = roiToSlice(blockStart,blockStop)
+                innerBlocks = self._blockNumbers[blockKey]
+                if lazyflow.verboseRequests:
+                    print "OpBlockedSparseLabelArray %r: request with key %r for %d inner Blocks " % (self,key, len(innerBlocks.ravel()))
+                for b_ind in innerBlocks.ravel():
+                    #which part of the original key does this block fill?
+                    offset = self._blockShape*self._flatBlockIndices[b_ind]
+                    bigstart = numpy.maximum(offset, start)
+                    bigstop = numpy.minimum(offset + self._blockShape, stop)
+
+                    smallstart = bigstart-offset
+                    smallstop = bigstop - offset
+
+                    bigkey = roiToSlice(bigstart-start, bigstop-start)
+                    smallkey = roiToSlice(smallstart, smallstop)
+                    if not b_ind in self._labelers or not self._labelers[b_ind].Output.ready():
+                        result[bigkey]=0
+                    else:
+                        try:
+                            labeler = self._labelers[b_ind]
+                            denseArray = labeler._denseArray[smallkey]
+                            result[bigkey]= denseArray
+                        except:
+                            print "Exception in OpBlockedSparseLabelArray.execute, probably due to simultaneous calls to setInSlot() and execute()"
+                            print "labeler =", labeler
+                            print "denseArray =", denseArray
+                            print "result =", result
+                            raise
+
+            elif slot.name == "nonzeroValues":
+                nzvalues = set()
+                for l in self._labelers.values():
+                    nzvalues |= set(l._sparseNZ.values())
+                result[0] = numpy.array(list(nzvalues))
+
+            elif slot.name == "nonzeroCoordinates":
+                print "not supported yet"
+                #result[0] = numpy.array(self._sparseNZ.keys())
+            elif slot.name == "nonzeroBlocks":
+                #we only return all non-zero blocks, no keys
+                slicelist = []
+                for b_ind in self._labelers.keys():
+                    offset = self._blockShape*self._flatBlockIndices[b_ind]
+                    bigstart = offset
+                    bigstop = numpy.minimum(offset + self._blockShape, self._cacheShape)
+                    bigkey = roiToSlice(bigstart, bigstop)
+                    slicelist.append(bigkey)
+
+                result[0] = slicelist
+            elif slot.name == "maxLabel":
+                result[0] = self._maxLabel
+
+            self.lock.release()
+            return result
 
         def setInSlot(self, slot, subindex, roi, value):
             key = roi.toSlice()
@@ -1124,7 +1149,7 @@ if has_blist:
                             # Don't connect deletelabel; it is set manually (here and also above)
                             self._labelers[b_ind].inputs["deleteLabel"].setValue(self.inputs["deleteLabel"].value)
                             self._labelers[b_ind].inputs["shape"].setValue(self._blockShape)
-                            self._labelers[b_ind].inputs["eraser"].connect(self.inputs["eraser"])
+                            self._labelers[b_ind].inputs["eraser"].setValue(self.inputs["eraser"].value)
 
                             # remember old max labele, i.e. 0 since we just created
                             self._oldMaxLabels[b_ind] = 0
@@ -1202,6 +1227,9 @@ class OpBlockedArrayCache(Operator):
             self._blockShape = None
             self._fixed_all_dirty = False  # this is a shortcut for storing wehter all subblocks are dirty
             self._forward_dirty = False
+            self._opDummy = None
+            self._opSub_list = {}
+            self._cache_list = {}
 
     def setupOutputs(self):
         with Tracer(self.traceLogger):
@@ -1219,8 +1247,8 @@ class OpBlockedArrayCache(Operator):
                 # FIXME: This is evil, but there's no convenient way around it.
                 # We don't want our output to be flagged as 'ready'
                 # The only way to do that is to temporarily connect it to an unready operator
-                opTmp = OpArrayPiper(graph=self.graph)
-                opTmp.Output.connect( self.Output )
+#                opTmp = OpArrayPiper(parent=self, graph=self.graph)
+#                opTmp.Output.connect( self.Output )
                 self._configured = False
                 return
             else:
@@ -1259,9 +1287,13 @@ class OpBlockedArrayCache(Operator):
                 self._flatBlockIndices =  _blockIndices[:]
                 self._flatBlockIndices = self._flatBlockIndices.reshape(self._flatBlockIndices.size/self._flatBlockIndices.shape[-1],self._flatBlockIndices.shape[-1],)
 
+                for op in self._cache_list.values():
+                    op.cleanUp()
+                for op in self._opSub_list.values():
+                    op.cleanUp()
+
                 self._opSub_list = {}
                 self._cache_list = {}
-
 
                 self._configured = True
 
@@ -1269,82 +1301,81 @@ class OpBlockedArrayCache(Operator):
                     self.Output.setDirty(slice(None))
 
     def execute(self, slot, subindex, roi, result):
-        with Tracer(self.traceLogger, msg='roi={}'.format(roi)):
-            if not self._configured:
-                # this happends when the operator is not yet fully configured due to fixAtCurrent == True
-                result[:] = 0
-                return
-    
-            #find the block key
-            key = roi.toSlice()
-            start, stop = roi.start, roi.stop
-    
-            blockStart = (start / self._blockShape)
-            blockStop = (stop * 1.0 / self._blockShape).ceil()
-            #blockStop = numpy.where(stop == self.shape, self._dirtyShape, blockStop)
-            blockKey = roiToSlice(blockStart,blockStop)
-            innerBlocks = self._blockNumbers[blockKey]
-    
-            if lazyflow.verboseRequests:
-                print "OpSparseArrayCache %r: request with key %r for %d inner Blocks " % (self,key, len(innerBlocks.ravel()))
-    
-    
-            requests = []
-            for b_ind in innerBlocks.flat:
-                #which part of the original key does this block fill?
-                offset = self._blockShape*self._flatBlockIndices[b_ind]
-                bigstart = numpy.maximum(offset, start)
-                bigstop = numpy.minimum(offset + self._blockShape, stop)
-    
-    
-                smallstart = bigstart-offset
-                smallstop = bigstop - offset
-    
-                diff = smallstop - smallstart
-                smallkey = roiToSlice(smallstart, smallstop)
-    
-                bigkey = roiToSlice(bigstart-start, bigstop-start)
+        if not self._configured:
+            # this happends when the operator is not yet fully configured due to fixAtCurrent == True
+            result[:] = 0
+            return
 
-                with self._lock:    
-                    if not self._fixed:
-                        if not self._cache_list.has_key(b_ind):
+        #find the block key
+        key = roi.toSlice()
+        start, stop = roi.start, roi.stop
 
-                            self._opSub_list[b_ind] = generic.OpSubRegion(self)
-                            self._opSub_list[b_ind].inputs["Input"].connect(self.inputs["Input"])
-                            tstart = self._blockShape*self._flatBlockIndices[b_ind]
-                            tstop = numpy.minimum((self._flatBlockIndices[b_ind]+numpy.ones(self._flatBlockIndices[b_ind].shape, numpy.uint8))*self._blockShape, self.shape)
-        
-                            self._opSub_list[b_ind].inputs["Start"].setValue(tuple(tstart))
-                            self._opSub_list[b_ind].inputs["Stop"].setValue(tuple(tstop))
-        
-                            self._cache_list[b_ind] = OpArrayCache(self)
-                            self._cache_list[b_ind].inputs["Input"].connect(self._opSub_list[b_ind].outputs["Output"])
-                            self._cache_list[b_ind].inputs["fixAtCurrent"].connect( self.fixAtCurrent )
-                            self._cache_list[b_ind].inputs["blockShape"].setValue(self.inputs["innerBlockShape"].value)
-                            # we dont register a callback for dirtyness, since we already forward the signal
+        blockStart = (start / self._blockShape)
+        blockStop = (stop * 1.0 / self._blockShape).ceil()
+        #blockStop = numpy.where(stop == self.shape, self._dirtyShape, blockStop)
+        blockKey = roiToSlice(blockStart,blockStop)
+        innerBlocks = self._blockNumbers[blockKey]
 
-                if self._cache_list.has_key(b_ind):
-                    op = self._cache_list[b_ind]
-                    #req = self._cache_list[b_ind].outputs["Output"][smallkey].writeInto(result[bigkey])
+        if lazyflow.verboseRequests:
+            print "OpSparseArrayCache %r: request with key %r for %d inner Blocks " % (self,key, len(innerBlocks.ravel()))
+
+
+        requests = []
+        for b_ind in innerBlocks.flat:
+            #which part of the original key does this block fill?
+            offset = self._blockShape*self._flatBlockIndices[b_ind]
+            bigstart = numpy.maximum(offset, start)
+            bigstop = numpy.minimum(offset + self._blockShape, stop)
+
+
+            smallstart = bigstart-offset
+            smallstop = bigstop - offset
+
+            diff = smallstop - smallstart
+            smallkey = roiToSlice(smallstart, smallstop)
+
+            bigkey = roiToSlice(bigstart-start, bigstop-start)
+
+            with self._lock:    
+                if not self._fixed:
+                    if not self._cache_list.has_key(b_ind):
+
+                        self._opSub_list[b_ind] = generic.OpSubRegion(parent=self)
+                        self._opSub_list[b_ind].inputs["Input"].connect(self.inputs["Input"])
+                        tstart = self._blockShape*self._flatBlockIndices[b_ind]
+                        tstop = numpy.minimum((self._flatBlockIndices[b_ind]+numpy.ones(self._flatBlockIndices[b_ind].shape, numpy.uint8))*self._blockShape, self.shape)
     
-                    smallroi = SubRegion(op.outputs["Output"], start = smallstart , stop= smallstop)
-                    op.execute(op.outputs["Output"], (), smallroi, result[bigkey])
+                        self._opSub_list[b_ind].inputs["Start"].setValue(tuple(tstart))
+                        self._opSub_list[b_ind].inputs["Stop"].setValue(tuple(tstop))
     
-                    ####op.getOutSlot(op.outputs["Output"],smallkey,result[bigkey])
-                    #requests.append(req)
-                else:
-                    #When this block has never been in the cache and the current
-                    #value is fixed (fixAtCurrent=True), return 0  values
-                    #This prevents random noise appearing in such cases.
-                    result[bigkey] = 0
-                    with self._lock:
-                        # Since a downstream operator has expressed an interest in this block,
-                        #  mark it to be signaled as dirty when we become unfixed.
-                        # Otherwise, downstream operators won't know when there's valid data in this block.
-                        self._fixed_dirty_blocks.add(b_ind)
-    
-            for r in requests:
-                r.wait()
+                        self._cache_list[b_ind] = OpArrayCache(parent=self)
+                        self._cache_list[b_ind].inputs["Input"].connect(self._opSub_list[b_ind].outputs["Output"])
+                        self._cache_list[b_ind].inputs["fixAtCurrent"].connect( self.fixAtCurrent )
+                        self._cache_list[b_ind].inputs["blockShape"].setValue(self.inputs["innerBlockShape"].value)
+                        # we dont register a callback for dirtyness, since we already forward the signal
+
+            if self._cache_list.has_key(b_ind):
+                op = self._cache_list[b_ind]
+                #req = self._cache_list[b_ind].outputs["Output"][smallkey].writeInto(result[bigkey])
+
+                smallroi = SubRegion(op.outputs["Output"], start = smallstart , stop= smallstop)
+                op.execute(op.outputs["Output"], (), smallroi, result[bigkey])
+
+                ####op.getOutSlot(op.outputs["Output"],smallkey,result[bigkey])
+                #requests.append(req)
+            else:
+                #When this block has never been in the cache and the current
+                #value is fixed (fixAtCurrent=True), return 0  values
+                #This prevents random noise appearing in such cases.
+                result[bigkey] = 0
+                with self._lock:
+                    # Since a downstream operator has expressed an interest in this block,
+                    #  mark it to be signaled as dirty when we become unfixed.
+                    # Otherwise, downstream operators won't know when there's valid data in this block.
+                    self._fixed_dirty_blocks.add(b_ind)
+
+        for r in requests:
+            r.wait()
 
 
     def propagateDirty(self, slot, subindex, roi):
@@ -1423,14 +1454,18 @@ class OpSlicedBlockedArrayCache(Operator):
         self._outerShapes = self.inputs["outerBlockShape"].value
         self._innerShapes = self.inputs["innerBlockShape"].value
 
+        # FIXME: This is wrong: Shouldn't it actually compare the new inner block shape with the old one?
         if len(self._innerShapes) != len(self._innerOps):
+            # Clean up previous inner operators
+            for slot in self.InnerOutputs:
+                slot.disconnect()
             for o in self._innerOps:
-                o.disconnect()
+                o.cleanUp()
 
             self._innerOps = []
 
             for i,innershape in enumerate(self._innerShapes):
-                op = OpBlockedArrayCache(self)
+                op = OpBlockedArrayCache(parent=self)
                 op.inputs["fixAtCurrent"].connect(self.inputs["fixAtCurrent"])
                 self._innerOps.append(op)
                 

@@ -49,7 +49,53 @@ class OpA(graph.Operator):
             self.Output2.setDirty(roi)
         if inputSlot == self.Input3:
             self.Output3.setDirty(roi)
-            
+
+class OpTesting5ToMulti(graph.Operator):
+    name = "OpTesting5ToMulti"
+
+    inputSlots = []
+    for i in xrange(5):
+        inputSlots.append(graph.InputSlot("Input%.1d"%(i), optional = True))
+    outputSlots = [graph.OutputSlot("Outputs", level=1)]
+
+    def setupOutputs(self):
+        length = 0
+        for slot in self.inputs.values():
+            if slot.connected():
+                length += 1
+
+        self.outputs["Outputs"].resize(length)
+
+        i = 0
+        for sname in sorted(self.inputs.keys()):
+            slot = self.inputs[sname]
+            if slot.connected():
+                self.outputs["Outputs"][i].meta.assignFrom( slot.meta )
+                i += 1
+
+    def execute(self, slot, subindex, roi, result):
+        key = roiToSlice(roi.start, roi.stop)
+        index = subindex[0]
+        i = 0
+        for sname in sorted(self.inputs.keys()):
+            slot = self.inputs[sname]
+            if slot.connected():
+                if i == index:
+                    return slot[key].allocate().wait()
+                i += 1
+
+    def propagateDirty(self, islot, subindex, roi):
+        i = 0
+        for sname in sorted(self.inputs.keys()):
+            slot = self.inputs[sname]
+            if slot == islot:
+                self.outputs["Outputs"][i].setDirty(roi)
+                break
+            if slot.connected():
+                self.outputs["Outputs"][i].meta.assignFrom( slot.meta )
+                i += 1
+    
+
 class TestOperator_setupOutputs(object):
 
     def setUp(self):
@@ -298,8 +344,8 @@ class TestSlotStates(object):
             connectedSlots[slot] = True
         
         # Test notifyConnect
-        op.Input.notifyConnect( handleConnect )
-        op.Output.notifyConnect( handleConnect )
+        op.Input._notifyConnect( handleConnect )
+        op.Output._notifyConnect( handleConnect )
         
         readySlots = { op.Input  : False,
                        op.Output : False }
@@ -338,8 +384,8 @@ class TestSlotStates(object):
             connectedSlots[slot] = True
         
         # Test notifyConnect
-        op.Input.notifyConnect( handleConnect )
-        op.Output.notifyConnect( handleConnect )
+        op.Input._notifyConnect( handleConnect )
+        op.Output._notifyConnect( handleConnect )
         
         readySlots = { op.Input  : False,
                        op.Output : False }
@@ -367,7 +413,7 @@ class TestSlotStates(object):
         
     def test_implicitlyConnectedMultiOutputs(self):
         # The array piper copies its input to its output, creating an "implicit" connection
-        op = operators.Op5ToMulti(graph=self.g)
+        op = OpTesting5ToMulti(graph=self.g)
         
         assert not op.Input0.connected()
         assert not op.Outputs.connected()
@@ -380,8 +426,8 @@ class TestSlotStates(object):
             connectedSlots.add(slot)
         
         # Test notifyConnect
-        op.Input0.notifyConnect( handleConnect )
-        op.Outputs.notifyConnect( handleConnect )
+        op.Input0._notifyConnect( handleConnect )
+        op.Outputs._notifyConnect( handleConnect )
         
         readySlots = set()
         def handleReady(slot):
@@ -444,8 +490,8 @@ class TestSlotStates(object):
             connectedSlots[slot] = True
         
         # Test notifyConnect
-        op.Input.notifyConnect( handleConnect )
-        op.Output.notifyConnect( handleConnect )
+        op.Input._notifyConnect( handleConnect )
+        op.Output._notifyConnect( handleConnect )
         
         readySlots = { op.Input  : False,
                        op.Output : False }

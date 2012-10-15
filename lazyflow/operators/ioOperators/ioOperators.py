@@ -1,6 +1,6 @@
 import math
 import vigra,numpy,h5py,glob
-from lazyflow.graph import Operator,OutputSlot,InputSlot
+from lazyflow.graph import OrderedSignal, Operator, OutputSlot, InputSlot
 from lazyflow.roi import roiToSlice
 
 import logging
@@ -36,6 +36,7 @@ class OpH5Writer(Operator):
             #create H5File and DataSet
             f = h5py.File(filename, 'w')
         except:
+            assert False
             return
         g = f
 
@@ -122,6 +123,20 @@ class OpH5Writer(Operator):
         self.WriteImage.setDirty(slice(None))
 
 class OpStackLoader(Operator):
+    """
+    Imports an image stack.
+    Note: This operator does NOT cache the images, so direct access via the execute() 
+          function is very inefficient, especially through the Z-axis.
+          Typically, you'll want to connect this operator to a cache whose block size is large in the X-Y plane.
+    
+    Input:
+    globstring - A glob string as defined by the glob module.
+                 We also support the following special extension to globstring syntax:
+                 A single string can hold a *list* of globstrings.
+                     Each separate globstring in the list is separated by two forward slashes (//).
+                     For, example, '/a/b/c.txt///d/e/f.txt//../g/i/h.txt' is parsed as:
+                     ['/a/b/c.txt', '/d/e/f.txt', '../g/i/h.txt']
+    """
     name = "Image Stack Reader"
     category = "Input"
 
@@ -129,9 +144,12 @@ class OpStackLoader(Operator):
     outputSlots = [OutputSlot("stack")]
 
     def setupOutputs(self):
-        globString = self.inputs["globstring"].value
-        self.fileNameList = sorted(glob.glob(globString))
-
+        self.fileNameList = []
+        globStrings = self.inputs["globstring"].value
+        
+        # Parse list into separate globstrings and combine them
+        for globString in sorted(globStrings.split("//")):
+            self.fileNameList += sorted(glob.glob(globString))
 
         if len(self.fileNameList) != 0:
             self.info = vigra.impex.ImageInfo(self.fileNameList[0])
@@ -231,8 +249,8 @@ class OpStackToH5Writer(Operator):
 
     def __init__(self, *args, **kwargs):
         super(OpStackToH5Writer, self).__init__(*args, **kwargs)
+        self.progressSignal = OrderedSignal()
         self.opStackLoader = OpStackLoader(graph=self.graph, parent=self)
-        
         self.opStackLoader.globstring.connect( self.GlobString )
     
     def setupOutputs(self):
@@ -290,19 +308,25 @@ class OpStackToH5Writer(Operator):
 
         data = group.create_dataset(internalPath,
                                     #compression='gzip',
-                                    #compression_opts=4
+                                    #compression_opts=4,
                                     shape=dataShape,
                                     dtype=dtype,
                                     chunks=chunkShape)
         # Now copy each image
+        self.progressSignal(0)
         for z in range(numImages):
             # Ask for an entire z-slice (exactly one whole image from the stack)
             slicing = [slice(None)] * len(stackTags)
             slicing[zAxis] = slice(z, z+1)            
             data[tuple(slicing)] = self.opStackLoader.stack[slicing].wait()
+            self.progressSignal( z*100 / numImages )
             
         # We're done
         result[...] = True
+        
+        self.progressSignal(100)
+        
+        return result
         
 if __name__ == '__main__':
     from lazyflow.graph import Graph
