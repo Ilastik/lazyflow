@@ -112,10 +112,35 @@ def _singleMissingLayer(layer=30, nx=64,ny=64,nz=100,method='linear'):
 
 class TestDetection(unittest.TestCase):
     def setUp(self):
+        v = _volume()
         self.op = OpDetectMissing(graph=Graph())
+        self.op.InputVolume.setValue(v)
         self.op.PatchSize.setValue(64)
         self.op.HaloSize.setValue(0)
-        #self.op.DetectionMethod.setValue('svm')
+        self.op.DetectionMethod.setValue('svm')
+        self.op.train(force=True)
+        
+    def testDetectorOmnipresence(self):
+        assert self.op.has(self.op.NHistogramBins.value), "Detector is untrained after call to train()"
+        assert not self.op.has(self.op.NHistogramBins.value+2), "Wrong bin size trained."
+        
+        op2 = OpDetectMissing(graph=Graph())
+        assert op2.has(self.op.NHistogramBins.value), "Trained detectors are not global"
+        
+        self.op.reset()
+        assert not self.op.has(self.op.NHistogramBins.value), "Detector not reset."
+        assert not op2.has(self.op.NHistogramBins.value), "Detector not reset globally."
+        
+        
+    
+    def testDetectorPropagation(self):
+        
+        s = self.op.Detector[:].wait()
+        self.op.reset()
+        assert not self.op.has(self.op.NHistogramBins.value), "Detector not reset."
+        self.op.OverloadDetector.setValue(s)
+        assert self.op.has(self.op.NHistogramBins.value), "Detector not loaded."
+        
         
     def testClassicDetection(self):
         self.op.DetectionMethod.setValue('classic')
@@ -127,6 +152,8 @@ class TestDetection(unittest.TestCase):
         assert_array_equal(self.op.Output[:].wait().view(type=np.ndarray),\
                                 m.view(type=np.ndarray),\
                                 err_msg="input with single black layer")
+                            
+                            
     def testSVMDetection(self):
         try:
             import sklearn
@@ -211,6 +238,34 @@ class TestDetection(unittest.TestCase):
     def testPersistence(self):
         dumpedString = self.op.dumps()
         self.op.loads(dumpedString)
+        
+    def testPatchify(self):
+        from lazyflow.operators.opInterpMissingData import _patchify as patchify
+        
+        X = np.vander(np.arange(2,5))
+        (patches,slices) = patchify(X,1,1)
+        
+        expected = [np.array([[4,2],[9,3]]), \
+                    np.array([[4,2,1],[9,3,1]]), \
+                    np.array([[2,1],[3,1]]), \
+                    np.array([[4,2],[9,3],[16,4]]), \
+                    np.array([[4,2,1],[9,3,1],[16,4,1]]), \
+                    np.array([[2,1],[3,1],[4,1]]), \
+                    np.array([[9,3],[16,4]]), \
+                    np.array([[9,3,1],[16,4,1]]), \
+                    np.array([[3,1],[4,1]])]
+                
+        for ep in expected:
+            has = False
+            for p in patches:
+                if np.all(p == ep):
+                    has = True
+            
+            assert has, "Mising patch {}".format(ep)
+        
+        # FIXME missing slice comparison
+                    
+        
     
 class TestInterpolation(unittest.TestCase):
     '''
@@ -349,22 +404,20 @@ class TestInterpMissingData(unittest.TestCase):
     def setUp(self):
         g=Graph()
         op = OpInterpMissingData(graph = g)
+        op.detector.train(force=True)
         self.op = op
-    
+        
+        
     def testDetectorPropagation(self):
-        (volume, _, expected) = _getTestVolume(_testDescriptions[0], 'linear')
-        self.op.InputVolume.setValue(volume)
-        _ = self.op.Output[:].wait()
+        v = _volume()
+        self.op.InputVolume.setValue(v)
         s = self.op.Detector[:].wait()
+        self.op.detector.reset()
+        assert not self.op.detector.has(self.op.detector.NHistogramBins.value), "Detector not reset."
+        self.op.OverloadDetector.setValue(s)
+        assert self.op.detector.has(self.op.detector.NHistogramBins.value), "Detector not loaded."
+
         
-        g=Graph()
-        op2 = OpInterpMissingData(graph = g)
-        op2.InputVolume.setValue(volume)
-        op2.OverloadDetector.setValue(s)
-        
-        assert op2.detector._manager.has(op2.detector.NHistogramBins.value)
-        
-    
     def testLinearBasics(self):
         self.op.InputSearchDepth.setValue(0)
         
