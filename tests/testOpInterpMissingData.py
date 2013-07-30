@@ -121,6 +121,7 @@ class TestDetection(unittest.TestCase):
         self.op.train(force=True)
         
     def testDetectorOmnipresence(self):
+        self.setUp()
         assert self.op.has(self.op.NHistogramBins.value), "Detector is untrained after call to train()"
         assert not self.op.has(self.op.NHistogramBins.value+2), "Wrong bin size trained."
         
@@ -134,7 +135,7 @@ class TestDetection(unittest.TestCase):
         
     
     def testDetectorPropagation(self):
-        
+        self.setUp()
         s = self.op.Detector[:].wait()
         self.op.reset()
         assert not self.op.has(self.op.NHistogramBins.value), "Detector not reset."
@@ -409,6 +410,7 @@ class TestInterpMissingData(unittest.TestCase):
         
         
     def testDetectorPropagation(self):
+        self.setUp()
         v = _volume()
         self.op.InputVolume.setValue(v)
         s = self.op.Detector[:].wait()

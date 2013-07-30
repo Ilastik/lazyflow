@@ -42,6 +42,8 @@ class OpInterpMissingData(Operator):
     # be careful when using the following two: setting the same thing twice will not trigger
     # the action you desire, even if something else has changed
     OverloadDetector = InputSlot(value='')
+    
+    #FIXME shouldn't this be an output slot???
     TrainDetector = InputSlot(value=0)
     
       
