@@ -23,7 +23,8 @@ from lazyflow.graph import Operator, InputSlot, OutputSlot
 
 logger = logging.getLogger(__name__)
 
-class OpVigraLabelVolume(Operator):
+
+class _OpVigraLabelVolume(Operator):
     """
     Operator that simply wraps vigra's labelVolume function.
     """
@@ -103,4 +104,12 @@ class OpVigraLabelVolume(Operator):
             self.Output.setDirty( slice(None) )
         elif inputSlot == self.BackgroundValue:
             self.Output.setDirty( slice(None) )
+
+
+class OpVigraLabelVolume(_OpVigraLabelVolume):
+    def __init__(self, *args, **kwargs):
+        super(OpVigraLabelVolume, self).__init__(*args, **kwargs)
+        logger.info("Usage of OpVigraLabelVolume is deprecated,"
+                    " use OpLabelVolume instead!")
+
 
