@@ -1,3 +1,19 @@
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+#
+# Copyright 2011-2014, the ilastik developers
+
 import logging
 from functools import partial
 import cPickle as pickle
@@ -423,7 +439,7 @@ class OpDetectMissing(Operator):
         else:
             try:
                 svm = cls._manager.get(nBins)
-            except NotTrainedError:
+            except SVMManager.NotTrainedError:
                 # fail gracefully if not trained => responsibility of user!
                 svm = PseudoSVC()
 
@@ -540,7 +556,7 @@ class SVMManager(object):
         try:
             return self._svms[n]
         except KeyError:
-            raise NotTrainedError(
+            raise self.NotTrainedError(
                 "Detector for bin size {} not trained.\nHave {}.".format(
                     n, self._svms))
 
@@ -1104,9 +1120,9 @@ if __name__ == "__main__":
                     logger.info(
                         "Detector written to {}".format(f.name))
                 except Exception as e:
-                    print("==== BEGIN DETECTOR DUMP ====")
-                    print(op.dumps())
-                    print("==== END DETECTOR DUMP ====")
+                    logger.error("==== BEGIN DETECTOR DUMP ====")
+                    logger.error(op.dumps())
+                    logger.error("==== END DETECTOR DUMP ====")
                     logger.error(str(e))
 
                 if len(testHistograms) == 0:
