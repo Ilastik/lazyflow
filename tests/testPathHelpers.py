@@ -20,7 +20,8 @@ class TestPathHelpers(object):
     
     def testCompressPathForDisplay(self):
         assert compressPathForDisplay("/a/b.txt", 30) == "/a/b.txt"
-        path = "/test/bla/bla/this_is_a_very_long_filename_bla_bla.txt"
+        path = ("/home/myname/mydir/my-ilastik-playground/some-dataset/"
+                "file_with_a_very_very_very_very_very_long_name.ilp")
         for l in [5,10,15,20,30]:
             assert len(compressPathForDisplay(path, l)) == l
         
