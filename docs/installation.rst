@@ -1,7 +1,7 @@
 Installation
 ============
 lazyflow requires python 2.7, numpy, vigra, greenlet and psutil packages:
-  
+
 
 ``sudo easy_install numpy greenlet psutil``
 
@@ -12,9 +12,8 @@ Optional requirements for lazyflow are the h5py library
 
 After installing the prerequisites lazyflow can be installed:
 
-``python setup.py config``
-
-``python setup.py build``
-
 ``sudo python setup.py install``
 
+To build the extensions in the source tree:
+
+``python setup.py build_ext --inplace``
