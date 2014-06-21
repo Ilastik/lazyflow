@@ -22,10 +22,12 @@
 
 from os.path import join
 from distutils.core import setup, Extension
+from numpy.distutils.misc_util import get_numpy_include_dirs
 
 drtile = Extension('lazyflow.drtile.drtile',
                    sources = [join('lazyflow','drtile', 'drtile.cpp')],
                    libraries  = ['boost_python'],
+                   include_dirs = get_numpy_include_dirs(),
                    language = 'c++')
 
 packages = ['lazyflow', 'lazyflow.drtile', 'lazyflow.request',
