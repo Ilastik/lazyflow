@@ -11,6 +11,4 @@ then
   cd $2
 fi
 
-cd lazyflow/drtile
-cmake -DVIGRA_NUMPY_CORE_LIBRARY=/home/travis/virtualenv/lib/python2.7/site-packages/vigra/vigranumpycore.so .
-make
+python setup.py build_ext
