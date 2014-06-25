@@ -1,116 +1,192 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 #Python
-import time
 import copy
-from functools import partial
 import logging
 traceLogger = logging.getLogger("TRACE." + __name__)
 
 #SciPy
 import numpy
-import vigra
 
 #lazyflow
 from lazyflow.graph import Operator, InputSlot, OutputSlot, OrderedSignal, OperatorWrapper
-from lazyflow.roi import sliceToRoi, roiToSlice
-from lazyflow.request import Request, RequestPool
-from lazyflow.utility import traceLogged
+from lazyflow.roi import sliceToRoi, roiToSlice, getIntersection, roiFromShape
+from lazyflow.classifiers import LazyflowVectorwiseClassifierABC, LazyflowVectorwiseClassifierFactoryABC, \
+                                 LazyflowPixelwiseClassifierABC, LazyflowPixelwiseClassifierFactoryABC
 
 from opFeatureMatrixCache import OpFeatureMatrixCache
 from opConcatenateFeatureMatrices import OpConcatenateFeatureMatrices
 
-class OpTrainRandomForest(Operator):
-    name = "TrainRandomForest"
-    description = "Train a random forest on multiple images"
-    category = "Learning"
-
-    inputSlots = [InputSlot("Images", level=1),InputSlot("Labels", level=1), InputSlot("fixClassifier", stype="bool")]
-    outputSlots = [OutputSlot("Classifier")]
+class OpTrainClassifierBlocked(Operator):
+    Images = InputSlot(level=1)
+    Labels = InputSlot(level=1)
+    ClassifierFactory = InputSlot()
+    nonzeroLabelBlocks = InputSlot(level=1)
+    MaxLabel = InputSlot()
     
-    logger = logging.getLogger(__name__+".OpTrainRandomForest")
+    Classifier = OutputSlot()
+    
+    def __init__(self, *args, **kwargs):
+        super(OpTrainClassifierBlocked, self).__init__(*args, **kwargs)
+        self.progressSignal = OrderedSignal()
+        self._mode = None
+        
+        # Fully connect the vectorwise training operator
+        self._opVectorwiseTrain = OpTrainVectorwiseClassifierBlocked( parent=self )
+        self._opVectorwiseTrain.Images.connect( self.Images )
+        self._opVectorwiseTrain.Labels.connect( self.Labels )
+        self._opVectorwiseTrain.ClassifierFactory.connect( self.ClassifierFactory )
+        self._opVectorwiseTrain.nonzeroLabelBlocks.connect( self.nonzeroLabelBlocks )
+        self._opVectorwiseTrain.MaxLabel.connect( self.MaxLabel )
+        self._opVectorwiseTrain.progressSignal.subscribe( self.progressSignal )
 
-    def __init__(self, parent = None):
-        Operator.__init__(self, parent)
-        self._forest_count = 4
-        # TODO: Make treecount configurable via an InputSlot
-        self._tree_count = 25
-
+        # Fully connect the pixelwise training operator
+        self._opPixelwiseTrain = OpTrainPixelwiseClassifierBlocked( parent=self )            
+        self._opPixelwiseTrain.Images.connect( self.Images )
+        self._opPixelwiseTrain.Labels.connect( self.Labels )
+        self._opPixelwiseTrain.ClassifierFactory.connect( self.ClassifierFactory )
+        self._opPixelwiseTrain.nonzeroLabelBlocks.connect( self.nonzeroLabelBlocks )
+        self._opPixelwiseTrain.MaxLabel.connect( self.MaxLabel )
+        self._opPixelwiseTrain.progressSignal.subscribe( self.progressSignal )
+        
     def setupOutputs(self):
-        if self.inputs["fixClassifier"].value == False:
-            self.outputs["Classifier"].meta.dtype = object
-            self.outputs["Classifier"].meta.shape = (self._forest_count,)
-            self.outputs["Classifier"].setDirty((slice(0,1,None),))
+        # Construct an inner operator depending on the type of classifier we'll be creating.
+        classifier_factory = self.ClassifierFactory.value        
+        if issubclass( type(classifier_factory), LazyflowVectorwiseClassifierFactoryABC ):
+            new_mode = 'vectorwise'
+        elif issubclass( type(classifier_factory), LazyflowPixelwiseClassifierFactoryABC ):
+            new_mode = 'pixelwise'
+        else:
+            raise Exception("Unknown classifier factory type: {}".format( type(classifier_factory) ) )
+        
+        if new_mode == self._mode:
+            return
+        
+        self.Classifier.disconnect()
+        self._mode = new_mode
+        
+        if self._mode == 'vectorwise':
+            self.Classifier.connect( self._opVectorwiseTrain.Classifier )
+        elif self._mode == 'pixelwise':
+            self.Classifier.connect( self._opPixelwiseTrain.Classifier )
 
-    #FIXME: It is not possible to access the class variable logger here.
-    #
-    #@traceLogged(OpTrainRandomForest.logger, level=logging.INFO, msg="OpTrainRandomForest: Training Classifier")
     def execute(self, slot, subindex, roi, result):
-        featMatrix=[]
-        labelsMatrix=[]
-        for i,labels in enumerate(self.inputs["Labels"]):
-            if labels.meta.shape is not None:
-                labels=labels[:].wait()
+        assert False, "Shouldn't get here..."
 
-                indexes=numpy.nonzero(labels[...,0].view(numpy.ndarray))
-                #Maybe later request only part of the region?
+    def propagateDirty(self, slot, subindex, roi):
+        pass
 
-                image=self.inputs["Images"][i][:].wait()
+class OpTrainPixelwiseClassifierBlocked(Operator):
+    Images = InputSlot(level=1)
+    Labels = InputSlot(level=1)
+    ClassifierFactory = InputSlot()
+    nonzeroLabelBlocks = InputSlot(level=1)
+    MaxLabel = InputSlot()
+    
+    Classifier = OutputSlot()
 
-                features=image[indexes]
-                labels=labels[indexes]
+    def __init__(self, *args, **kwargs):
+        super(OpTrainPixelwiseClassifierBlocked, self).__init__(*args, **kwargs)
+        self.progressSignal = OrderedSignal()
+    
+    def setupOutputs(self):
+        for slot in list(self.Images) + list(self.Labels):
+            assert slot.meta.getAxisKeys()[-1] == 'c', \
+                "This opearator assumes channel is the last axis."
+        
+        self.Classifier.meta.dtype = object
+        self.Classifier.meta.shape = (1,)
 
-                featMatrix.append(features)
-                labelsMatrix.append(labels)
+        # Special metadata for downstream operators using the classifier
+        self.Classifier.meta.classifier_factory = self.ClassifierFactory.value
 
+    def cleanUp(self):
+        self.progressSignal.clean()
+        super( OpTrainPixelwiseClassifierBlocked, self ).cleanUp()
 
-        featMatrix=numpy.concatenate(featMatrix,axis=0)
-        labelsMatrix=numpy.concatenate(labelsMatrix,axis=0)
+    def execute(self, slot, subindex, roi, result):
+        classifier_factory = self.ClassifierFactory.value
+        assert issubclass(type(classifier_factory), LazyflowPixelwiseClassifierFactoryABC), \
+            "Factory is of type {}, which does not satisfy the LazyflowPixelwiseClassifierFactoryABC interface."\
+            "".format( type(classifier_factory) )
+        
+        # Accumulate all non-zero blocks of each image into lists
+        label_data_blocks = []
+        image_data_blocks = []
+        for image_slot, label_slot, nonzero_block_slot in zip(self.Images, self.Labels, self.nonzeroLabelBlocks):
+            block_slicings = nonzero_block_slot.value
+            for block_slicing in block_slicings:
+                block_label_roi = sliceToRoi( block_slicing, image_slot.meta.shape )
 
-        # train and store self._forest_count forests in parallel
-        pool = RequestPool()
-        for i in range(self._forest_count):
-            def train_and_store(number):
-                result[number] = vigra.learning.RandomForest(self._tree_count)
-                result[number].learnRF(featMatrix.astype(numpy.float32),labelsMatrix.astype(numpy.uint32))
-            req = pool.request(partial(train_and_store, i))
+                # Ask for the halo needed by the classifier
+                axiskeys = image_slot.meta.getAxisKeys()
+                halo_shape = classifier_factory.get_halo_shape(axiskeys)
+                assert len(halo_shape) == len( block_label_roi[0] )
+                assert halo_shape[-1] == 0, "Didn't expect a non-zero halo for channel dimension."
 
-        pool.wait()
+                # Expand block by halo, then clip to image bounds
+                block_label_roi = numpy.array( block_label_roi )
+                block_label_roi[0] -= halo_shape
+                block_label_roi[1] += halo_shape
+                block_label_roi = getIntersection( block_label_roi, roiFromShape(image_slot.meta.shape) )
 
+                block_image_roi = numpy.array( block_label_roi )
+                assert (block_image_roi[:, -1] == [0,1]).all()
+                num_channels = image_slot.meta.shape[-1]
+                block_image_roi[:, -1] = [0, num_channels]
+
+                # Ensure the results are plain ndarray, not VigraArray, 
+                #  which some classifiers might have trouble with.
+                block_label_data = numpy.asarray( label_slot(*block_label_roi).wait() )
+                block_image_data = numpy.asarray( image_slot(*block_image_roi).wait() )
+                
+                label_data_blocks.append( block_label_data )
+                image_data_blocks.append( block_image_data )
+                
+        classifier = classifier_factory.create_and_train_pixelwise( image_data_blocks, label_data_blocks )
+        assert issubclass(type(classifier), LazyflowPixelwiseClassifierABC), \
+            "Classifier is of type {}, which does not satisfy the LazyflowPixelwiseClassifierABC interface."\
+            "".format( type(classifier) )
+        result[0] = classifier
         return result
 
     def propagateDirty(self, slot, subindex, roi):
-        if slot is not self.inputs["fixClassifier"] and self.inputs["fixClassifier"].value == False:
-            self.outputs["Classifier"].setDirty((slice(0,1,None),))
+        self.Classifier.setDirty()
 
-class OpTrainRandomForestBlocked(Operator):
+class OpTrainVectorwiseClassifierBlocked(Operator):
     Images = InputSlot(level=1)
     Labels = InputSlot(level=1)
+    ClassifierFactory = InputSlot()
     nonzeroLabelBlocks = InputSlot(level=1) # TODO: Eliminate this slot. It isn't used any more...
     MaxLabel = InputSlot()
     
     Classifier = OutputSlot()
     
-    # Images[N] ---                                                                                    MaxLabel ------
-    #              \                                                                                                  \
-    # Labels[N] --> opFeatureMatrixCaches ---(FeatureImage[N])---> opConcatenateFeatureImages ---(FeatureMatrices)---> OpTrainFromFeatures ---(Classifier)--->
+    # Images[N] ---                                                                                         MaxLabel ------
+    #              \                                                                                                       \
+    # Labels[N] --> opFeatureMatrixCaches ---(FeatureImage[N])---> opConcatenateFeatureImages ---(label+feature matrix)---> OpTrainFromFeatures ---(Classifier)--->
 
     def __init__(self, *args, **kwargs):
-        super(OpTrainRandomForestBlocked, self).__init__(*args, **kwargs)        
+        super(OpTrainVectorwiseClassifierBlocked, self).__init__(*args, **kwargs)
         self.progressSignal = OrderedSignal()
         
         self._opFeatureMatrixCaches = OperatorWrapper( OpFeatureMatrixCache, parent=self )
@@ -122,7 +198,8 @@ class OpTrainRandomForestBlocked(Operator):
         self._opConcatenateFeatureMatrices.FeatureMatrices.connect( self._opFeatureMatrixCaches.LabelAndFeatureMatrix )
         self._opConcatenateFeatureMatrices.ProgressSignals.connect( self._opFeatureMatrixCaches.ProgressSignal )
         
-        self._opTrainFromFeatures = OpTrainRandomForestFromFeatures( parent=self )
+        self._opTrainFromFeatures = OpTrainClassifierFromFeatureVectors( parent=self )
+        self._opTrainFromFeatures.ClassifierFactory.connect( self.ClassifierFactory )
         self._opTrainFromFeatures.LabelAndFeatureMatrix.connect( self._opConcatenateFeatureMatrices.ConcatenatedOutput )
         self._opTrainFromFeatures.MaxLabel.connect( self.MaxLabel )
         
@@ -137,6 +214,11 @@ class OpTrainRandomForestBlocked(Operator):
             self.progressSignal( 100.0 )
         self._opTrainFromFeatures.trainingCompleteSignal.subscribe( _handleTrainingComplete )
 
+    def cleanUp(self):
+        self.progressSignal.clean()
+        self.Classifier.disconnect()
+        super( OpTrainVectorwiseClassifierBlocked, self ).cleanUp()
+
     def setupOutputs(self):
         pass # Nothing to do; our output is connected to an internal operator.
 
@@ -146,35 +228,33 @@ class OpTrainRandomForestBlocked(Operator):
     def propagateDirty(self, slot, subindex, roi):
         pass
 
-class OpTrainRandomForestFromFeatures(Operator):
+class OpTrainClassifierFromFeatureVectors(Operator):
+    ClassifierFactory = InputSlot()
     LabelAndFeatureMatrix = InputSlot()
     
     MaxLabel = InputSlot()
     Classifier = OutputSlot()
     
     def __init__(self, *args, **kwargs):
-        super(OpTrainRandomForestFromFeatures, self).__init__(*args, **kwargs)
+        super(OpTrainClassifierFromFeatureVectors, self).__init__(*args, **kwargs)
         self.trainingCompleteSignal = OrderedSignal()
-        self._forest_count = 10
-        self._forests = (None,) * self._forest_count
-
-        # TODO: Make treecount configurable via an InputSlot
-        self._tree_count = 10
 
         # TODO: Progress...
         #self.progressSignal = OrderedSignal()
 
     def setupOutputs(self):
-        self.outputs["Classifier"].meta.dtype = object
-        self.outputs["Classifier"].meta.shape = (self._forest_count,)
+        self.Classifier.meta.dtype = object
+        self.Classifier.meta.shape = (1,)
+        
+        # Special metadata for downstream operators using the classifier
+        self.Classifier.meta.classifier_factory = self.ClassifierFactory.value
 
     def execute(self, slot, subindex, roi, result):
         labels_and_features = self.LabelAndFeatureMatrix.value
         featMatrix = labels_and_features[:,1:]
-        labelsMatrix = labels_and_features[:,0:1]
+        labelsMatrix = labels_and_features[:,0:1].astype(numpy.uint32)
         
         maxLabel = self.MaxLabel.value
-        labelList = range(1, maxLabel+1) if maxLabel > 0 else list()
 
         if featMatrix.shape[0] < maxLabel:
             # If there isn't enough data for the random forest to train with, return None
@@ -182,324 +262,302 @@ class OpTrainRandomForestFromFeatures(Operator):
             self.trainingCompleteSignal()
             return
 
-        try:
-            self.logger.debug("Learning %d random forests with %d trees each with vigra..." % (self._forest_count, self._tree_count))
-            t = time.time()
-            # train and store self._forest_count forests in parallel
-            pool = RequestPool()
+        classifier_factory = self.ClassifierFactory.value
+        assert issubclass(type(classifier_factory), LazyflowVectorwiseClassifierFactoryABC), \
+            "Factory is of type {}, which does not satisfy the LazyflowVectorwiseClassifierFactoryABC interface."\
+            "".format( type(classifier_factory) )
 
-            for i in range(self._forest_count):
-                def train_and_store(number):
-                    result[number] = vigra.learning.RandomForest(self._tree_count, labels=labelList)
-                    result[number].learnRF( numpy.asarray(featMatrix, dtype=numpy.float32),
-                                            numpy.asarray(labelsMatrix, dtype=numpy.uint32))
-                req = pool.request(partial(train_and_store, i))
+        classifier = classifier_factory.create_and_train( featMatrix, labelsMatrix[:,0] )
+        assert issubclass(type(classifier), LazyflowVectorwiseClassifierABC), \
+            "Classifier is of type {}, which does not satisfy the LazyflowVectorwiseClassifierABC interface."\
+            "".format( type(classifier) )
 
-            pool.wait()
-            pool.clean()
-
-            self.logger.debug("Learning %d random forests with %d trees each with vigra took %f sec." % \
-                (self._forest_count, self._tree_count, time.time()-t))
-        except:
-            self.logger.error( "ERROR: could not learn classifier" )
-            
-            if numpy.prod(featMatrix.shape) > 0:
-                m = featMatrix.max()
-            else:
-                m = 'N/A'
-            self.logger.error( "featMatrix shape={}, max={}, dtype={}".format(featMatrix.shape, m, featMatrix.dtype) )
-
-            if numpy.prod(labelsMatrix.shape) > 0:
-                m = labelsMatrix.max()
-            else:
-                m = 'N/A'
-            self.logger.error( "labelsMatrix shape={}, max={}, dtype={}".format(labelsMatrix.shape, m, labelsMatrix.dtype ) )
-
-            raise
-
-        self._forests = result
+        result[0] = classifier
         
         self.trainingCompleteSignal()
         return result
 
     def propagateDirty(self, slot, subindex, roi):
-        self.Classifier.setDirty()        
-
-class OpTrainRandomForestBlocked_OLD(Operator):
-    # TODO: Eliminate this obsolete operator....
-    name = "TrainRandomForestBlocked"
-    description = "Train a random forest on multiple images"
-    category = "Learning"
-
-    inputSlots = [InputSlot("Images", level=1),InputSlot("Labels", level=1), \
-                  InputSlot("nonzeroLabelBlocks", level=1), InputSlot("MaxLabel")]
-    outputSlots = [OutputSlot("Classifier")]
-
-    WarningEmitted = False
-    
-    logger = logging.getLogger(__name__+".OpTrainRandomForestBlocked")
-
-    def __init__(self, *args, **kwargs):
-        super(OpTrainRandomForestBlocked, self).__init__(*args, **kwargs)
-        self.progressSignal = OrderedSignal()
-        self._forest_count = 10
-        # TODO: Make treecount configurable via an InputSlot
-        self._tree_count = 10
-        self._forests = (None,) * self._forest_count
-
-    def setupOutputs(self):
-        self.outputs["Classifier"].meta.dtype = object
-        self.outputs["Classifier"].meta.shape = (self._forest_count,)
-
-    @traceLogged(logger, level=logging.DEBUG, msg="OpTrainRandomForestBlocked: Training Classifier")
-    def execute(self, slot, subindex, roi, result):
-        progress = 0
-        self.progressSignal(progress)
-        numImages = len(self.Images)
-
-        featMatrix=[]
-        labelsMatrix=[]
-        for i,labels in enumerate(self.inputs["Labels"]):
-            if labels.meta.shape is not None:
-                #labels=labels[:].wait()
-                blocks = self.inputs["nonzeroLabelBlocks"][i][0].wait()
-
-                progress += 10/numImages
-                self.progressSignal(progress)
-
-                reqlistlabels = []
-                reqlistfeat = []
-                traceLogger.debug("Sending requests for {} non-zero blocks (labels and data)".format( len(blocks[0])) )
-                for b in blocks[0]:
-
-                    request = labels[b]
-                    featurekey = list(b)
-                    featurekey[-1] = slice(None, None, None)
-                    request2 = self.inputs["Images"][i][featurekey]
-
-                    reqlistlabels.append(request)
-                    reqlistfeat.append(request2)
-
-                traceLogger.debug("Requests prepared")
-
-                numLabelBlocks = len(reqlistlabels)
-                progress_outer = [progress] # Store in list for closure access
-                if numLabelBlocks > 0:
-                    progressInc = (80-10)/numLabelBlocks/numImages
-
-                def progressNotify(req):
-                    # Note: If we wanted perfect progress reporting, we could use lock here
-                    #       to protect the progress from being incremented simultaneously.
-                    #       But that would slow things down and imperfect reporting is okay for our purposes.
-                    progress_outer[0] += progressInc/2
-                    self.progressSignal(progress_outer[0])
-
-                for ir, req in enumerate(reqlistfeat):
-                    req.notify_finished(progressNotify)
-                    req.submit()
-
-                for ir, req in enumerate(reqlistlabels):
-                    req.notify_finished(progressNotify)
-                    req.submit()
-
-                traceLogger.debug("Requests fired")
-
-                for ir, req in enumerate(reqlistlabels):
-                    traceLogger.debug("Waiting for a label block...")
-                    labblock = req.wait()
-
-                    traceLogger.debug("Waiting for an image block...")
-                    image = reqlistfeat[ir].wait()
-
-                    indexes=numpy.nonzero(labblock[...,0].view(numpy.ndarray))
-                    
-                    # Even though our input is supposed to be "nonzeroLabelBlocks"
-                    #  users are allowed to give some all-zero blocks.
-                    # If this block all zero, discard and continue with next block.
-                    if len(indexes[0]) > 0:
-                        features=image[indexes]
-                        labbla=labblock[indexes]
-    
-                        featMatrix.append(features)
-                        labelsMatrix.append(labbla)
-
-                progress = progress_outer[0]
-
-                traceLogger.debug("Requests processed")
-
-        self.progressSignal(80/numImages)
-
-        if len(featMatrix) == 0 or len(labelsMatrix) == 0:
-            # If there was no actual data for the random forest to train with, we return None
-            result[:] = None
-            self.progressSignal(100)
-        else:
-            featMatrix=numpy.concatenate(featMatrix,axis=0)
-            labelsMatrix=numpy.concatenate(labelsMatrix,axis=0)
-            
-            maxLabel = self.MaxLabel.value
-            labelList = range(1, maxLabel+1) if maxLabel > 0 else list()
-
-            try:
-                self.logger.debug("Learning %d random forests with %d trees each with vigra..." % (self._forest_count, self._tree_count))
-                t = time.time()
-                # train and store self._forest_count forests in parallel
-                pool = RequestPool()
-
-                for i in range(self._forest_count):
-                    def train_and_store(number):
-                        result[number] = vigra.learning.RandomForest(self._tree_count, labels=labelList)
-                        result[number].learnRF( numpy.asarray(featMatrix, dtype=numpy.float32),
-                                                numpy.asarray(labelsMatrix, dtype=numpy.uint32))
-                    req = pool.request(partial(train_and_store, i))
-
-                pool.wait()
-                pool.clean()
-
-                self.logger.debug("Learning %d random forests with %d trees each with vigra took %f sec." % \
-                    (self._forest_count, self._tree_count, time.time()-t))
-            except:
-                self.logger.error( "ERROR: could not learn classifier" )
-                self.logger.error( "featMatrix shape={}, max={}, dtype={}".format(featMatrix.shape, featMatrix.max(), featMatrix.dtype) )
-                self.logger.error( "labelsMatrix shape={}, max={}, dtype={}".format(labelsMatrix.shape, labelsMatrix.max(), labelsMatrix.dtype ) )
-                raise
-            finally:
-                self.progressSignal(100)
-
-        self._forests = result
-        return result
-
-    def propagateDirty(self, slot, subindex, roi):
         self.Classifier.setDirty()
 
-class OpPredictRandomForest(Operator):
-    name = "PredictRandomForest"
-    description = "Predict on multiple images"
-    category = "Learning"
 
-    inputSlots = [InputSlot("Image"),InputSlot("Classifier"), InputSlot("LabelsCount")]
-    outputSlots = [OutputSlot("PMaps")]
+class OpClassifierPredict(Operator):
+    Image = InputSlot()
+    LabelsCount = InputSlot()
+    Classifier = InputSlot()
     
-    logger = logging.getLogger(__name__+".OpPredictRandomForestBlocked")
+    # An entire prediction request is skipped if the mask is all zeros for the requested roi.
+    # Otherwise, the request is serviced as usual and the mask is ignored.
+    PredictionMask = InputSlot(optional=True)
 
+    PMaps = OutputSlot()
+    
     def __init__(self, *args, **kwargs):
-        super( OpPredictRandomForest, self ).__init__(*args, **kwargs)
-
+        super( OpClassifierPredict, self ).__init__(*args, **kwargs)
+        self._mode = None
+        self._prediction_op = None
+    
     def setupOutputs(self):
+        # Construct an inner operator depending on the type of classifier we'll be using.
+        # We don't want to access the classifier directly here because that would trigger the full computation already.
+        # Instead, we require the factory to be passed along with the classifier metadata.
+        
+        try:
+            classifier_factory = self.Classifier.meta.classifier_factory
+        except KeyError:
+            raise Exception( "Classifier slot must include classifier factory as metadata." )
+        
+        if issubclass( classifier_factory.__class__, LazyflowVectorwiseClassifierFactoryABC ):
+            new_mode = 'vectorwise'
+        elif issubclass( classifier_factory.__class__, LazyflowPixelwiseClassifierFactoryABC ):
+            new_mode = 'pixelwise'
+        else:
+            raise Exception("Unknown classifier factory type: {}".format( type(classifier_factory) ) )
+        
+        if new_mode == self._mode:
+            return
+        
+        if self._mode is not None:
+            self.PMaps.disconnect()
+            self._prediction_op.cleanUp()
+        self._mode = new_mode
+        
+        if self._mode == 'vectorwise':
+            self._prediction_op = OpVectorwiseClassifierPredict( parent=self )
+        elif self._mode == 'pixelwise':
+            self._prediction_op = OpPixelwiseClassifierPredict( parent=self )            
+
+        self._prediction_op.PredictionMask.connect( self.PredictionMask )
+        self._prediction_op.Image.connect( self.Image )
+        self._prediction_op.LabelsCount.connect( self.LabelsCount )
+        self._prediction_op.Classifier.connect( self.Classifier )
+        self.PMaps.connect( self._prediction_op.PMaps )
+
+    def execute(self, slot, subindex, roi, result):
+        assert False, "Shouldn't get here..."
+
+    def propagateDirty(self, slot, subindex, roi):
+        if slot == self.Classifier:
+            self.PMaps.setDirty()
+
+class OpPixelwiseClassifierPredict(Operator):
+    Image = InputSlot()
+    LabelsCount = InputSlot()
+    Classifier = InputSlot()
+
+    # An entire prediction request is skipped if the mask is all zeros for the requested roi.
+    # Otherwise, the request is serviced as usual and the mask is ignored.
+    PredictionMask = InputSlot(optional=True)
+
+    PMaps = OutputSlot()
+    
+    def __init__(self, *args, **kwargs):
+        super( OpPixelwiseClassifierPredict, self ).__init__(*args, **kwargs)
+
+        # Make sure the entire image is dirty if the prediction mask is removed.
+        self.PredictionMask.notifyUnready( lambda s: self.PMaps.setDirty() )
+    
+    def setupOutputs(self):
+        assert self.Image.meta.getAxisKeys()[-1] == 'c'
+        
         nlabels = max(self.LabelsCount.value, 1) #we'll have at least 2 labels once we actually predict something
                                                 #not setting it to 0 here is friendlier to possible downstream
                                                 #ilastik operators, setting it to 2 causes errors in pixel classification
                                                 #(live prediction doesn't work when only two labels are present)
-        
+
         self.PMaps.meta.dtype = numpy.float32
         self.PMaps.meta.axistags = copy.copy(self.Image.meta.axistags)
         self.PMaps.meta.shape = self.Image.meta.shape[:-1]+(nlabels,) # FIXME: This assumes that channel is the last axis
         self.PMaps.meta.drange = (0.0, 1.0)
 
     def execute(self, slot, subindex, roi, result):
-        t1 = time.time()
-        key = roi.toSlice()
+        classifier = self.Classifier.value
+        
+        # Training operator may return 'None' if there was no data to train with
+        skip_prediction = (classifier is None)
 
-        traceLogger.debug("OpPredictRandomForest: Requesting classifier. roi={}".format(roi))
-        forests=self.inputs["Classifier"][:].wait()
+        # Shortcut: If the mask is totally zero, skip this request entirely
+        if not skip_prediction and self.PredictionMask.ready():
+            mask_roi = numpy.array((roi.start, roi.stop))
+            mask_roi[:,-1:] = [[0],[1]]
+            start, stop = map(tuple, mask_roi)
+            mask = self.PredictionMask( start, stop ).wait()
+            skip_prediction = not numpy.any(mask)
 
-        if forests is None or any(x is None for x in forests):
-            # Training operator may return 'None' if there was no data to train with
-            return numpy.zeros(numpy.subtract(roi.stop, roi.start), dtype=numpy.float32)[...]
+        if skip_prediction:
+            result[:] = 0.0
+            return result
 
-        traceLogger.debug("OpPredictRandomForest: Got classifier")
+        assert issubclass(type(classifier), LazyflowPixelwiseClassifierABC), \
+            "Classifier is of type {}, which does not satisfy the LazyflowPixelwiseClassifierABC interface."\
+            "".format( type(classifier) )
 
-        newKey = key[:-1]
-        newKey += (slice(0,self.inputs["Image"].meta.shape[-1],None),)
+        upstream_roi = (roi.start, roi.stop)
+        # Ask for the halo needed by the classifier
+        axiskeys = self.Image.meta.getAxisKeys()
+        halo_shape = classifier.get_halo_shape(axiskeys)
+        assert len(halo_shape) == len( upstream_roi[0] )
+        assert halo_shape[-1] == 0, "Didn't expect a non-zero halo for channel dimension."
 
-        res = self.inputs["Image"][newKey].wait()
+        # Expand block by halo, then clip to image bounds
+        upstream_roi = numpy.array( upstream_roi )
+        upstream_roi[0] -= halo_shape
+        upstream_roi[1] += halo_shape
+        upstream_roi = getIntersection( upstream_roi, roiFromShape(self.Image.meta.shape) )
+        upstream_roi = numpy.asarray( upstream_roi )
 
-        shape=res.shape
-        prod = numpy.prod(shape[:-1])
-        res.shape = (prod, shape[-1])
-        features=res
+        # Determine how to extract the data from the result (without the halo)
+        downstream_roi = numpy.array((roi.start, roi.stop))
+        downstream_channels = self.PMaps.meta.shape[-1]
+        roi_within_result = downstream_roi - upstream_roi[0]
+        roi_within_result[:,-1] = [0, downstream_channels]
 
-        predictions = [0]*len(forests)
+        # Request all upstream channels
+        input_channels = self.Image.meta.shape[-1]
+        upstream_roi[:,-1] = [0, input_channels]
 
-        def predict_forest(number):
-            predictions[number] = forests[number].predictProbabilities(numpy.asarray(features, dtype=numpy.float32))
+        # Request the data
+        input_data = self.Image(*upstream_roi).wait()
+        probabilities = classifier.predict_probabilities_pixelwise( input_data )
+        
+        # We're expecting a channel for each label class.
+        # If we didn't provide at least one sample for each label,
+        #  we may get back fewer channels.
+        if probabilities.shape[-1] != self.PMaps.meta.shape[-1]:
+            # Copy to an array of the correct shape
+            # This is slow, but it's an unusual case
+            assert probabilities.shape[-1] == len(classifier.known_classes)
+            full_probabilities = numpy.zeros( probabilities.shape[:-1] + (self.PMaps.meta.shape[-1],), dtype=numpy.float32 )
+            for i, label in enumerate(classifier.known_classes):
+                full_probabilities[..., label-1] = probabilities[..., i]
+            
+            probabilities = full_probabilities
 
-        t2 = time.time()
-
-        # predict the data with all the forests in parallel
-        pool = RequestPool()
-
-        for i,f in enumerate(forests):
-            pool.add( Request(partial(predict_forest, i)) )
-
-        pool.wait()
-        pool.clean()
-
-        prediction=numpy.dstack(predictions)
-        prediction = numpy.average(prediction, axis=2)
-        prediction.shape =  shape[:-1] + (forests[0].labelCount(),)
-
+        # Extract requested region (discard halo)
+        probabilities = probabilities[ roiToSlice(*roi_within_result) ]
+        
         # Copy only the prediction channels the client requested.
-        result[...] = prediction[...,roi.start[-1]:roi.stop[-1]]
-        
-        t3 = time.time()
-
-        self.logger.debug("predict roi=%r took %fseconds, actual RF time was %fs, feature time was %fs" % (key, t3-t1, t3-t2, t2-t1))
-        
+        result[...] = probabilities[...,roi.start[-1]:roi.stop[-1]]
         return result
 
     def propagateDirty(self, slot, subindex, roi):
-        if slot == self.inputs["Classifier"]:
+        if slot == self.Classifier:
             self.logger.debug("classifier changed, setting dirty")
-            self.outputs["PMaps"].setDirty()
-        elif slot == self.inputs["Image"]:
-            self.outputs["PMaps"].setDirty()
+            self.PMaps.setDirty()
+        elif slot == self.Image:
+            self.PMaps.setDirty()
+        elif slot == self.PredictionMask:
+            self.PMaps.setDirty(roi.start, roi.stop)
 
-
-class OpSegmentation(Operator):
-    name = "OpSegmentation"
-    description = "displaying highest probability class for each pixel"
-
-    inputSlots = [InputSlot("Input")]
-    outputSlots = [OutputSlot("Output")]
+class OpVectorwiseClassifierPredict(Operator):
+    Image = InputSlot()
+    LabelsCount = InputSlot()
+    Classifier = InputSlot()
     
-    logger = logging.getLogger(__name__+".OpSegmentation")
+    # An entire prediction request is skipped if the mask is all zeros for the requested roi.
+    # Otherwise, the request is serviced as usual and the mask is ignored.
+    PredictionMask = InputSlot(optional=True)
+    
+    PMaps = OutputSlot()
+
+    def __init__(self, *args, **kwargs):
+        super( OpVectorwiseClassifierPredict, self ).__init__(*args, **kwargs)
+
+        # Make sure the entire image is dirty if the prediction mask is removed.
+        self.PredictionMask.notifyUnready( lambda s: self.PMaps.setDirty() )
 
     def setupOutputs(self):
-        inputSlot = self.inputs["Input"]
-        self.outputs["Output"].meta.shape = inputSlot.meta.shape[:-1] + (1,)
-        self.outputs["Output"].meta.dtype = numpy.uint8 #who is going to have more than 256 classes?
-        self.outputs["Output"].meta.axistags = inputSlot.meta.axistags
+        assert self.Image.meta.getAxisKeys()[-1] == 'c'
+        
+        nlabels = max(self.LabelsCount.value, 1) #we'll have at least 2 labels once we actually predict something
+                                                #not setting it to 0 here is friendlier to possible downstream
+                                                #ilastik operators, setting it to 2 causes errors in pixel classification
+                                                #(live prediction doesn't work when only two labels are present)
+
+        self.PMaps.meta.assignFrom( self.Image.meta )
+        self.PMaps.meta.dtype = numpy.float32
+        self.PMaps.meta.shape = self.Image.meta.shape[:-1]+(nlabels,) # FIXME: This assumes that channel is the last axis
+        self.PMaps.meta.drange = (0.0, 1.0)
+        
+        ideal_blockshape = self.Image.meta.ideal_blockshape
+        if ideal_blockshape is None:
+            ideal_blockshape = (0,) * len( self.Image.meta.shape )
+        ideal_blockshape = list(ideal_blockshape)
+        ideal_blockshape[-1] = self.PMaps.meta.shape[-1]
+        self.PMaps.meta.ideal_blockshape = tuple(ideal_blockshape)
+        
+        output_channels = nlabels
+        input_channels = self.Image.meta.shape[-1]
+        # Temporarily consumed RAM includes the following:
+        # >> result array: 4 * N output_channels
+        # >> (times 2 due to temporary variable)
+        # >> input data allocation
+        ram_per_pixel = 4.0 * output_channels * 2 + self.Image.meta.dtype().nbytes * input_channels
+        ram_per_pixel = max( ram_per_pixel, self.Image.meta.ram_usage_per_requested_pixel )
+        self.PMaps.meta.ram_usage_per_requested_pixel = ram_per_pixel
 
     def execute(self, slot, subindex, roi, result):
-        key = roiToSlice(roi.start,roi.stop)
-        shape = self.inputs["Input"].meta.shape
+        classifier = self.Classifier.value
+        
+        # Training operator may return 'None' if there was no data to train with
+        skip_prediction = (classifier is None)
 
-        rstart, rstop = sliceToRoi(key, self.outputs["Output"].meta.shape)
-        rstart[-1] = 0
-        rstop[-1] = shape[-1]
-        rkey = roiToSlice(rstart, rstop)
-        img = self.inputs["Input"][rkey].wait()
-        axis = img.ndim - 1
-        result = numpy.argmax(img, axis=axis)
-        result.resize(result.shape + (1,))
+        # Shortcut: If the mask is totally zero, skip this request entirely
+        if not skip_prediction and self.PredictionMask.ready():
+            mask_roi = numpy.array((roi.start, roi.stop))
+            mask_roi[:,-1:] = [[0],[1]]
+            start, stop = map(tuple, mask_roi)
+            mask = self.PredictionMask( start, stop ).wait()
+            skip_prediction = not numpy.any(mask)
+            del mask
+
+        if skip_prediction:
+            result[:] = 0.0
+            return result
+
+        assert issubclass(type(classifier), LazyflowVectorwiseClassifierABC), \
+            "Classifier is of type {}, which does not satisfy the LazyflowVectorwiseClassifierABC interface."\
+            "".format( type(classifier) )
+
+        key = roi.toSlice()
+        newKey = key[:-1]
+        newKey += (slice(0,self.Image.meta.shape[-1],None),)
+
+        input_data = self.Image[newKey].wait()
+        shape=input_data.shape
+        prod = numpy.prod(shape[:-1])
+        features = input_data.reshape((prod, shape[-1]))
+
+        probabilities = classifier.predict_probabilities( features )
+        
+        # We're expecting a channel for each label class.
+        # If we didn't provide at least one sample for each label,
+        #  we may get back fewer channels.
+        if probabilities.shape[1] != self.PMaps.meta.shape[-1]:
+            # Copy to an array of the correct shape
+            # This is slow, but it's an unusual case
+            assert probabilities.shape[-1] == len(classifier.known_classes)
+            full_probabilities = numpy.zeros( probabilities.shape[:-1] + (self.PMaps.meta.shape[-1],), dtype=numpy.float32 )
+            for i, label in enumerate(classifier.known_classes):
+                full_probabilities[:, label-1] = probabilities[:, i]
+            
+            probabilities = full_probabilities
+        
+        # Reshape to image
+        probabilities.shape = shape[:-1] + (self.PMaps.meta.shape[-1],)
+
+        # Copy only the prediction channels the client requested.
+        result[...] = probabilities[...,roi.start[-1]:roi.stop[-1]]
         return result
 
     def propagateDirty(self, slot, subindex, roi):
-        key = roi.toSlice()
-        ndim = len(self.outputs['Output'].meta.shape)
-        if len(key) > ndim:
-            key = key[:ndim]
-        self.outputs["Output"].setDirty(key)
-
-    @property
-    def shape(self):
-        return self.outputs["Output"].meta.shape
-
-    @property
-    def dtype(self):
-        return self.outputs["Output"].meta.dtype
-
+        if slot == self.Classifier:
+            self.logger.debug("classifier changed, setting dirty")
+            self.PMaps.setDirty()
+        elif slot == self.Image:
+            self.PMaps.setDirty()
+        elif slot == self.PredictionMask:
+            self.PMaps.setDirty(roi.start, roi.stop)
 
 class OpAreas(Operator):
     name = "OpAreas"

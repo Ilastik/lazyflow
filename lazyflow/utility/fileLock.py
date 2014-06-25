@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 """
 Implementation of a simple cross-platform file locking mechanism.
 This is a modified version of code retrieved on 2013-01-01 from http://www.evanfosmark.com/2009/01/cross-platform-file-locking-support-in-python.
@@ -32,13 +37,19 @@ Modifications in this version:
    - ``__exit__`` always calls ``release()``.  It is therefore a bug to call ``release()`` from within a context manager.
    - Added ``locked()`` function. 
    - Added blocking parameter to ``acquire()`` method
+
+WARNINGS: 
+ - The locking mechanism used here may need to be changed to support NFS filesystems:
+   http://lwn.net/Articles/251004
+ - This code has not been thoroughly tested on Windows, and there has been one report of incorrect results on Windows XP and Windows 7.
+   The locking mechanism used in this class should (in theory) be cross-platform, but use at your own risk.
 """
 
 import os
 import sys
 import time
 import errno
- 
+
 class FileLock(object):
     """ A file locking mechanism that has context-manager support so 
         you can use it in a ``with`` statement. This should be relatively cross

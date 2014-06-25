@@ -1,3 +1,4 @@
-[submodule "submodules/dvidclient"]
-	path = submodules/dvidclient
-	url = http://github.com/stuarteberg/dvidclient
+
+[submodule "submodules/pydvid"]
+	path = submodules/pydvid
+	url = https://github.com/janelia-flyem/pydvid

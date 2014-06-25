@@ -1,21 +1,26 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 from lazyflow.graph import Operator, InputSlot, OutputSlot
-from lazyflow.operators import OpImageReader, OpBlockedArrayCache
+from lazyflow.operators import OpImageReader, OpBlockedArrayCache, OpMetadataInjector, OpSubRegion2
 from opStreamingHdf5Reader import OpStreamingHdf5Reader
 from opNpyFileReader import OpNpyFileReader
 from lazyflow.operators.ioOperators import OpStackLoader, OpBlockwiseFilesetReader, OpRESTfulBlockwiseFilesetReader
@@ -60,6 +65,10 @@ class OpInputDataReader(Operator):
     # Other types are determined via file extension
     WorkingDirectory = InputSlot(stype='filestring', optional=True)
     FilePath = InputSlot(stype='filestring')
+
+    # FIXME: Document this.
+    SubVolumeRoi = InputSlot(optional=True) # (start, stop)
+
     Output = OutputSlot()
     
     loggingName = __name__ + ".OpInputDataReader"
@@ -102,6 +111,7 @@ class OpInputDataReader(Operator):
         # Clean up before reconfiguring
         if self.internalOperator is not None:
             self.Output.disconnect()
+            self.opInjector.cleanUp()
             self.internalOperator.cleanUp()
             self.internalOperator = None
             self.internalOutput = None
@@ -128,8 +138,28 @@ class OpInputDataReader(Operator):
         if self.internalOutput is None:
             raise RuntimeError("Can't read " + filePath + " because it has an unrecognized format.")
 
+        # If we've got a ROI, append a subregion operator.
+        if self.SubVolumeRoi.ready():
+            self._opSubRegion = OpSubRegion2( parent=self )
+            self._opSubRegion.Roi.setValue( self.SubVolumeRoi.value )
+            self._opSubRegion.Input.connect( self.internalOutput )
+            self.internalOutput = self._opSubRegion.Output
+        
+        self.opInjector = OpMetadataInjector( parent=self )
+        self.opInjector.Input.connect( self.internalOutput )
+        
+        # Add metadata for estimated RAM usage if the internal operator didn't already provide it.
+        if self.internalOutput.meta.ram_per_pixelram_usage_per_requested_pixel is None:
+            ram_per_pixel = self.internalOutput.meta.dtype().nbytes
+            if 'c' in self.internalOutput.meta.getTaggedShape():
+                ram_per_pixel *= self.internalOutput.meta.getTaggedShape()['c']
+            self.opInjector.Metadata.setValue( {'ram_per_pixelram_usage_per_requested_pixel' : ram_per_pixel} )
+        else:
+            # Nothing to add
+            self.opInjector.Metadata.setValue( {} )            
+
         # Directly connect our own output to the internal output
-        self.Output.connect( self.internalOutput )
+        self.Output.connect( self.opInjector.Output )
     
     def _attemptOpenAsStack(self, filePath):
         if '*' in filePath:
@@ -162,8 +192,7 @@ class OpInputDataReader(Operator):
             h5File = h5py.File(externalPath, 'r')
         except Exception as e:
             msg = "Unable to open HDF5 File: {}".format( externalPath )
-            if hasattr(e, 'message'):
-                msg += e.message
+            msg += str(e)
             raise OpInputDataReader.DatasetReadError( msg )
         self._file = h5File
 

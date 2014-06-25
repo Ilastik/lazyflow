@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 from lazyflow.operators.ioOperators import OpInputDataReader
 import os
 import numpy
@@ -112,6 +117,18 @@ class TestOpInputDataReader(object):
         # Call cleanUp() to close the file that this operator opened        
         h5Reader.cleanUp()
         assert not h5Reader._file # Whitebox assertion...
+
+    def test_npy_with_roi(self):
+        a = numpy.indices((100,100,200)).astype( numpy.uint8 ).sum(0)
+        assert a.shape == (100,100,200)
+        numpy.save( self.testNpyDataFileName, a )
+        opReader = OpInputDataReader( graph=lazyflow.graph.Graph() )
+        opReader.FilePath.setValue( self.testNpyDataFileName )
+        opReader.SubVolumeRoi.setValue( ((10,20,30), (50, 70, 90)) )
+
+        all_data = opReader.Output[:].wait()
+        assert all_data.shape == ( 40, 50, 60 )
+        assert (all_data == a[ 10:50, 20:70, 30:90 ]).all()
 
 if __name__ == "__main__":
     import sys

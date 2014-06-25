@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 #Python
 import time
 import logging
@@ -105,6 +110,22 @@ class OpSlicedBlockedArrayCache(OpCache):
             op.inputs["outerBlockShape"].setValue(self._outerShapes[i])
 
         self.Output.meta.assignFrom(self.Input.meta)
+        
+        # Estimate ram usage            
+        ram_per_pixel = 0
+        if self.Output.meta.dtype == object or self.Output.meta.dtype == numpy.object_:
+            ram_per_pixel = sys.getsizeof(None)
+        elif numpy.issubdtype(self.Output.meta.dtype, numpy.dtype):
+            ram_per_pixel = self.Output.meta.dtype().nbytes
+
+        tagged_shape = self.Output.meta.getTaggedShape()
+        if 'c' in tagged_shape:
+            ram_per_pixel *= float(tagged_shape['c'])
+
+        if self.Output.meta.ram_usage_per_requested_pixel is not None:
+            ram_per_pixel = max( ram_per_pixel, self.Output.meta.ram_usage_per_requested_pixel )
+
+        self.Output.meta.ram_usage_per_requested_pixel = ram_per_pixel
 
         # We also provide direct access to each of our inner cache outputs.        
         self.InnerOutputs.resize( len(self._innerOps) )

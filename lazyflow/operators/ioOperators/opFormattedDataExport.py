@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 import os
 import collections
 import numpy
@@ -62,11 +67,11 @@ class OpFormattedDataExport(Operator):
     ConvertedImage = OutputSlot() # Not yet re-ordered
     ImageToExport = OutputSlot() # Preview of the pre-processed image that will be exported
     ExportPath = OutputSlot() # Location of the saved file after export is complete.
-    FormatSelectionIsValid = OutputSlot() # True or False depending on whether or not the currently selected format can support the current export data.
+    FormatSelectionErrorMsg = OutputSlot() # True or False depending on whether or not the currently selected format can support the current export data.
     
     ALL_FORMATS = OpExportSlot.ALL_FORMATS
     
-    # Simplified block diagram:                                          -> ConvertedImage                -> FormatSelectionIsValid
+    # Simplified block diagram:                                          -> ConvertedImage                -> FormatSelectionErrorMsg
     #                                                                   /                                /
     # Input -> opSubRegion -> opDrangeInjection -> opNormalizeAndConvert -> opReorderAxes -> opExportSlot -> ExportPath
     #                                                                                    \
@@ -106,7 +111,7 @@ class OpFormattedDataExport(Operator):
         self._opExportSlot.OutputFormat.connect( self.OutputFormat )
         
         self.ExportPath.connect( self._opExportSlot.ExportPath )
-        self.FormatSelectionIsValid.connect( self._opExportSlot.FormatSelectionIsValid )
+        self.FormatSelectionErrorMsg.connect( self._opExportSlot.FormatSelectionErrorMsg )
         self.progressSignal = self._opExportSlot.progressSignal
 
     def setupOutputs(self):

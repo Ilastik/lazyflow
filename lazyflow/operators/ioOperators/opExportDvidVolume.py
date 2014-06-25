@@ -13,14 +13,14 @@
 # Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
 #
 # Copyright 2011-2014, the ilastik developers
+import contextlib
 
-import vigra
+import numpy
 
-from dvidclient.volume_client import VolumeClient
-from dvidclient.volume_metainfo import MetaInfo
+import pydvid
 
 from lazyflow.graph import Operator, InputSlot
-from lazyflow.utility import OrderedSignal
+from lazyflow.utility import OrderedSignal, BigRequestStreamer
 from lazyflow.roi import roiFromShape
 
 import logging
@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 class OpExportDvidVolume(Operator):
     Input = InputSlot()
     NodeDataUrl = InputSlot() # Should be a url of the form http://<hostname>[:<port>]/api/node/<uuid>/<dataname>
+    OffsetCoord = InputSlot(optional=True)
     
     def __init__(self, transpose_axes, *args, **kwargs):
         super(OpExportDvidVolume, self).__init__(*args, **kwargs)
@@ -54,27 +55,56 @@ class OpExportDvidVolume(Operator):
         assert api == 'api'
         assert node == 'node'
         
-        # Request the data
-        data = vigra.taggedView( self.Input[:].wait(), self.Input.meta.axistags )
+        axiskeys = self.Input.meta.getAxisKeys()
+        shape = self.Input.meta.shape
         
         if self._transpose_axes:
-            data = data.transpose()
+            axiskeys = reversed(axiskeys)
+            shape = tuple(reversed(shape))
         
-        # FIXME: We assume the dataset needs to be created first.
-        #        If it already existed, this (presumably) causes an error on the DVID side.
-        metainfo = MetaInfo( data.shape, data.dtype.type, data.axistags )
+        axiskeys = "".join( axiskeys )
 
-        self.progressSignal(5)
-        VolumeClient.create_volume(hostname, uuid, dataname, metainfo)
+        if self.OffsetCoord.ready():
+            offset_start = self.OffsetCoord.value
+        else:
+            offset_start = (0,) * len( self.Input.meta.shape )
 
-        client = VolumeClient( hostname, uuid, dataname )
-        
-        # For now, we send the whole darn thing at once.
-        # TODO: Stream it over in blocks...
-        
-        # Send it to dvid
-        start, stop = roiFromShape(data.shape)
-        client.modify_subvolume( start, stop, data )
+        connection = pydvid.dvid_connection.DvidConnection( hostname )
+        with contextlib.closing( connection ):
+            self.progressSignal(5)
+            
+            # Get the dataset details
+            try:
+                metadata = pydvid.voxels.get_metadata(connection, uuid, dataname)
+            except pydvid.errors.DvidHttpError as ex:
+                if ex.status_code != 404:
+                    raise
+                # Dataset doesn't exist yet.  Let's create it.
+                metadata = pydvid.voxels.VoxelsMetadata.create_default_metadata( shape, 
+                                                                                 self.Input.meta.dtype, 
+                                                                                 axiskeys, 
+                                                                                 0.0, 
+                                                                                 "" )
+                pydvid.voxels.create_new(connection, uuid, dataname, metadata)
+    
+            # Since this class is generall used to push large blocks of data,
+            #  we'll be nice and set throttle=True
+            client = pydvid.voxels.VoxelsAccessor( connection, uuid, dataname, throttle=True )
+            
+            def handle_block_result(roi, data):
+                # Send it to dvid
+                roi = numpy.asarray(roi)
+                roi += offset_start
+                start, stop = roi
+                if self._transpose_axes:
+                    data = data.transpose()
+                    start = tuple(reversed(start))
+                    stop = tuple(reversed(stop))
+                    client.post_ndarray( start, stop, data )
+            requester = BigRequestStreamer( self.Input, roiFromShape( self.Input.meta.shape ) )
+            requester.resultSignal.subscribe( handle_block_result )
+            requester.progressSignal.subscribe( self.progressSignal )
+            requester.execute()
         
         self.progressSignal(100)
     

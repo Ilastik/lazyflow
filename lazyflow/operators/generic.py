@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 #Python
 import copy
 import logging
@@ -27,7 +32,8 @@ import vigra
 #lazyflow
 from lazyflow.graph import Operator, InputSlot, OutputSlot
 from lazyflow import roi
-from lazyflow.roi import roiToSlice, sliceToRoi, TinyVector
+from lazyflow.roi import roiToSlice, sliceToRoi, TinyVector, getIntersection
+from lazyflow.request import RequestPool
 
 def axisTagObjectFromFlag(flag):
 
@@ -108,7 +114,12 @@ class OpMultiArraySlicer(Operator):
         outshape=list(self.inputs["Input"].meta.shape)
         n=outshape.pop(indexAxis)
         outshape=tuple(outshape)
-
+        
+        if self.Input.meta.ideal_blockshape:
+            ideal_blockshape = list( self.Input.meta.ideal_blockshape )
+            ideal_blockshape.pop(indexAxis)
+            ideal_blockshape = tuple(ideal_blockshape)
+        
         outaxistags=copy.copy(self.inputs["Input"].meta.axistags)
         del outaxistags[flag]
 
@@ -121,6 +132,9 @@ class OpMultiArraySlicer(Operator):
             o.meta.shape = outshape
             if self.Input.meta.drange is not None:
                 o.meta.drange = self.Input.meta.drange
+
+            if self.Input.meta.ideal_blockshape:
+                o.meta.ideal_blockshape = ideal_blockshape
 
     def execute(self, slot, subindex, rroi, result):
         key = roiToSlice(rroi.start, rroi.stop)
@@ -298,9 +312,7 @@ class OpMultiArrayStacker(Operator):
         for inSlot in self.inputs["Images"]:
             inTagKeys = [ax.key for ax in inSlot.meta.axistags]
             if inSlot.partner is not None:
-                self.outputs["Output"].meta.dtype = inSlot.meta.dtype
-                self.outputs["Output"].meta.axistags = copy.copy(inSlot.meta.axistags)
-                #indexAxis=inSlot.meta.axistags.index(flag)
+                self.Output.meta.assignFrom( inSlot.meta )
 
                 outTagKeys = [ax.key for ax in self.outputs["Output"].meta.axistags]
 
@@ -327,6 +339,10 @@ class OpMultiArrayStacker(Operator):
             else:
                 #FIXME axisindex is not necessarily defined yet (try setValue on subslot)
                 newshape.insert(axisindex, c)
+                ideal_blockshape = self.Output.meta.ideal_blockshape
+                if ideal_blockshape is not None:
+                    ideal_blockshape = ideal_blockshape[:axisindex] + (1,) + ideal_blockshape[axisindex:]
+                    self.Output.meta.ideal_blockshape = ideal_blockshape
             self.outputs["Output"].meta.shape=tuple(newshape)
         else:
             self.outputs["Output"].meta.shape = None
@@ -349,45 +365,45 @@ class OpMultiArrayStacker(Operator):
         #print "requesting an outslot from stacker:", key, result.shape
         #print "input slots total: ", len(self.inputs['Images'])
         requests = []
-
+        
+        pool = RequestPool()
 
         for i, inSlot in enumerate(self.inputs['Images']):
-            if inSlot.ready():
-                req = None
-                inTagKeys = [ax.key for ax in inSlot.meta.axistags]
-                if flag in inTagKeys:
-                    slices = inSlot.meta.shape[axisindex]
-                    if cnt + slices >= start[axisindex] and start[axisindex]-cnt<slices and start[axisindex]+written<stop[axisindex]:
-                        begin = 0
-                        if cnt < start[axisindex]:
-                            begin = start[axisindex] - cnt
-                        end = slices
-                        if cnt + end > stop[axisindex]:
-                            end -= cnt + end - stop[axisindex]
-                        key_ = copy.copy(oldkey)
-                        key_.insert(axisindex, slice(begin, end, None))
-                        reskey = [slice(None, None, None) for x in range(len(result.shape))]
-                        reskey[axisindex] = slice(written, written+end-begin, None)
+            req = None
+            inTagKeys = [ax.key for ax in inSlot.meta.axistags]
+            if flag in inTagKeys:
+                slices = inSlot.meta.shape[axisindex]
+                if cnt + slices >= start[axisindex] and start[axisindex]-cnt<slices and start[axisindex]+written<stop[axisindex]:
+                    begin = 0
+                    if cnt < start[axisindex]:
+                        begin = start[axisindex] - cnt
+                    end = slices
+                    if cnt + end > stop[axisindex]:
+                        end -= cnt + end - stop[axisindex]
+                    key_ = copy.copy(oldkey)
+                    key_.insert(axisindex, slice(begin, end, None))
+                    reskey = [slice(None, None, None) for x in range(len(result.shape))]
+                    reskey[axisindex] = slice(written, written+end-begin, None)
 
-                        req = inSlot[tuple(key_)].writeInto(result[tuple(reskey)])
-                        written += end - begin
-                    cnt += slices
-                else:
-                    if cnt>=start[axisindex] and start[axisindex] + written < stop[axisindex]:
-                        #print "key: ", key, "reskey: ", reskey, "oldkey: ", oldkey
-                        #print "result: ", result.shape, "inslot:", inSlot.meta.shape
-                        reskey = [slice(None, None, None) for s in oldkey]
-                        reskey.insert(axisindex, written)
-                        destArea = result[tuple(reskey)]
-                        req = inSlot[tuple(oldkey)].writeInto(destArea)
-                        written += 1
-                    cnt += 1
+                    req = inSlot[tuple(key_)].writeInto(result[tuple(reskey)])
+                    written += end - begin
+                cnt += slices
+            else:
+                if cnt>=start[axisindex] and start[axisindex] + written < stop[axisindex]:
+                    #print "key: ", key, "reskey: ", reskey, "oldkey: ", oldkey
+                    #print "result: ", result.shape, "inslot:", inSlot.meta.shape
+                    reskey = [slice(None, None, None) for s in oldkey]
+                    reskey.insert(axisindex, written)
+                    destArea = result[tuple(reskey)]
+                    req = inSlot[tuple(oldkey)].writeInto(destArea)
+                    written += 1
+                cnt += 1
 
-                if req is not None:
-                    requests.append(req)
+            if req is not None:
+                pool.add(req)
 
-        for r in requests:
-            r.wait()
+        pool.wait()
+        pool.clean()
 
     def propagateDirty(self, inputSlot, subindex, roi):
         if not self.Output.ready():
@@ -490,7 +506,8 @@ class OpSubRegion(Operator):
         stop = self.inputs["Stop"].value
         assert isinstance(start, tuple)
         assert isinstance(stop, tuple)
-        assert len(start) == len(self.inputs["Input"].meta.shape)
+        assert len(start) == len(self.inputs["Input"].meta.shape), \
+            "dimension mismatch: {} vs {}".format( start, self.Input.meta.shape )
         assert len(start) == len(stop)
         assert (numpy.array(stop)>= numpy.array(start)).all()
     
@@ -544,6 +561,46 @@ class OpSubRegion(Operator):
             if ((smallstop - smallstart ) > 0).all():
                 self.Output.setDirty( smallstart, smallstop )
 
+class OpSubRegion2(Operator):
+    """
+    A simplified version of OpSubRegion:
+    - Takes a single Roi input instead of separate Start/Stop inputs.
+    - Always propagates dirty state.
+    - Simpler implementation...
+    """
+    Input = InputSlot()
+    Roi = InputSlot() # tuple: (start, stop)
+    Output = OutputSlot()
+
+    def setupOutputs(self):
+        self._roi = self.Roi.value
+        assert isinstance(self._roi[0], tuple)
+        assert isinstance(self._roi[1], tuple)
+        start, stop = map( TinyVector, self._roi )
+        assert len(start) == len(stop) == len(self.Input.meta.shape), \
+            "Roi dimensionality must match shape dimensionality"
+        if (start >= stop).any():
+            print "oops", start, stop
+            self.Output.meta.NOTREADY = True
+        else:
+            self.Output.meta.assignFrom( self.Input.meta )
+            self.Output.meta.shape = tuple( stop - start )
+    
+    def execute(self, slot, subindex, output_roi, result):
+        input_roi = numpy.array( (output_roi.start, output_roi.stop) )
+        input_roi += self._roi[0]
+        input_roi = map( tuple, input_roi )
+        self.Input(*input_roi).writeInto(result).wait()
+        return result
+
+    def propagateDirty(self, dirtySlot, subindex, input_dirty_roi):
+        input_dirty_roi = ( input_dirty_roi.start, input_dirty_roi.stop )
+        intersection = getIntersection( input_dirty_roi, self._roi, False )
+        if intersection:
+            output_dirty_roi = numpy.array(intersection)
+            output_dirty_roi -= self._roi[0]
+            output_dirty_roi = map( tuple, output_dirty_roi )
+            self.Output.setDirty( *output_dirty_roi )
 
 class OpMultiArrayMerger(Operator):
     inputSlots = [InputSlot("Inputs", level=1),InputSlot('MergingFunction')]
@@ -553,16 +610,14 @@ class OpMultiArrayMerger(Operator):
     category = "Misc"
 
     def setupOutputs(self):
-        shape=self.inputs["Inputs"][0].meta.shape
-        axistags=copy.copy(self.inputs["Inputs"][0].meta.axistags)
+        first_meta =self.inputs["Inputs"][0].meta 
 
-        self.outputs["Output"].meta.shape = shape
-        self.outputs["Output"].meta.axistags = axistags
+        self.outputs["Output"].meta.assignFrom( first_meta )
         self.outputs["Output"].meta.dtype = self.inputs["Inputs"][0].meta.dtype
 
         for input in self.inputs["Inputs"]:
-            assert input.meta.shape==shape, "Only possible merging consistent shapes"
-            assert input.meta.axistags==axistags, "Only possible merging same axistags"
+            assert input.meta.shape == first_meta.shape, "Only possible merging consistent shapes"
+            assert input.meta.axistags == first_meta.axistags, "Only possible merging same axistags"
 
         # If *all* inputs have a drange, then provide a drange for the output.
         # Note: This assumes the merging function is pixel-wise
@@ -592,7 +647,8 @@ class OpMultiArrayMerger(Operator):
         
         fun=self.inputs["MergingFunction"].value
 
-        return fun(data)
+        result[:] = fun(data)
+        return result
 
     def propagateDirty(self, dirtySlot, subindex, roi):
         if dirtySlot == self.MergingFunction:
@@ -610,8 +666,7 @@ class OpMaxChannelIndicatorOperator(Operator):
     Output = OutputSlot()
 
     def setupOutputs(self):
-        self.Output.meta.shape = self.Input.meta.shape
-        self.Output.meta.axistags = self.Input.meta.axistags
+        self.Output.meta.assignFrom( self.Input.meta )
         self.Output.meta.dtype = numpy.uint8
         self.Output.meta.drange = (0,1)
         self._num_channels = self.Input.meta.shape[-1]
@@ -645,8 +700,7 @@ class OpPixelOperator(Operator):
     def setupOutputs(self):
         self.function = self.inputs["Function"].value
 
-        self.Output.meta.shape = self.Input.meta.shape
-        self.Output.meta.axistags = self.Input.meta.axistags
+        self.Output.meta.assignFrom( self.Input.meta )
         
         # To determine the output dtype, we'll test the function on a tiny array.
         # For pathological functions, this might raise an exception (e.g. divide by zero).
@@ -815,7 +869,8 @@ class OpTransposeSlots(Operator):
     configured (e.g. if not all input multi-slots have the same length).
     The length of the output multi-slot must be specified explicitly.
     """
-    OutputLength = InputSlot() # The length of the j dimension = J.
+    OutputLength = InputSlot(value=0)   # The MINIMUM length of the j dimension = J. If the input isn't configured yet, 
+                                        #   the output slot will be at least this long (with empty subslots).
     Inputs = InputSlot(level=2, optional=True) # Optional so that the Output mslot is configured even if len(Inputs) == 0
     Outputs = OutputSlot(level=2)   # A level-2 multislot of len J.
                                     # For each inner (level-1) multislot, len(multislot) == len(self.Inputs)
@@ -826,7 +881,19 @@ class OpTransposeSlots(Operator):
         super( OpTransposeSlots, self ).__init__(*args, **kwargs)
 
     def setupOutputs(self):
-        self.Outputs.resize( self.OutputLength.value )
+        if len( self.Inputs ) == 0:
+            self.Outputs.resize( self.OutputLength.value )
+            for oslot in self.Outputs:
+                oslot.resize(0)
+            return
+
+        # If the inputs are in sync (all inner inputs have the same len)
+        #  then we'll resize the output.
+        # Otherwise, the output is not resized, but its inner slots are 
+        #  still connected if possible or marked 'not ready' otherwise.        
+        input_lens = map( lambda slot: len(slot), self.Inputs )
+        if len( set(input_lens) ) == 1:
+            self.Outputs.resize( max(input_lens[0], self.OutputLength.value ) )
         for j, mslot in enumerate( self.Outputs ):
             mslot.resize( len(self.Inputs) )
             for i, oslot in enumerate( mslot ):
@@ -883,7 +950,7 @@ class OpSelectSubslot(Operator):
     Select the Nth subslot from a multi-slot
     """
     SubslotIndex = InputSlot()
-    Inputs = InputSlot(level=1)
+    Inputs = InputSlot(level=1, optional=True)
     Output = OutputSlot()
     
     def setupOutputs(self):
@@ -899,12 +966,3 @@ class OpSelectSubslot(Operator):
 
     def propagateDirty(self, slot, subindex, roi):
         pass
-
-
-
-
-
-
-
-
-    

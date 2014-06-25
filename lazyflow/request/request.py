@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 # Built-in
 import sys
 import functools
@@ -273,7 +278,8 @@ class Request( object ):
 
             # Clean-up
             if self.greenlet is not None:
-                assert self.greenlet.owning_requests.pop() == self
+                popped = self.greenlet.owning_requests.pop()
+                assert popped == self
             self.greenlet = None
 
     def submit(self):
@@ -858,6 +864,7 @@ class RequestPool(object):
 
     def __init__(self):
         self._requests = set()
+        self._finishing_requests = set()
         self._started = False
 
     def __len__(self):
@@ -871,6 +878,18 @@ class RequestPool(object):
             # For now, we forbid this because it would allow some corner cases that we aren't unit-testing yet.
             # If this exception blocks a desirable use case, then change this behavior and provide a unit test.
             raise RequestPool.RequestPoolError("Attempted to add a request to a pool that was already started!")
+        def remove_request(result):
+            # This request is done executing, but not quite finished with its callbacks.
+            # See docstring in wait() for details.
+            self._finishing_requests.add(req)
+            try:
+                self._requests.remove(req)
+            except KeyError:
+                # request may have been removed already by the while
+                # loop in the wait() method
+                pass
+
+        req.notify_finished(remove_request)
         self._requests.add(req)
 
     def submit(self):
@@ -879,17 +898,61 @@ class RequestPool(object):
         """
         if self._started:
             raise RequestPool.RequestPoolError("Can't re-start a RequestPool that was already started.")
-        for req in self._requests:
-            req.submit()
+        # shallow copy prevents python complaining when finished requests
+        # remove themselves from self._requests
+        requests = self._requests.copy()
+        # while loop with pop() allows the gc to clean up completed requests
+        while requests:
+            requests.pop().submit()
 
     def wait(self):
         """
-        Wait for all requests in the pool to complete.
+        If the pool hasn't been submitted yet, submit it. Then wait for all requests in the pool to complete.
+        
+        To be efficient with memory, we attempt to discard requests quickly after they complete.
+        To achieve this, we keep requests in two sets:
+        
+        _requests: All requests that are still executing or 'finishing'
+        _finishing_requests: Requests whose main work has completed, but may still be executing callbacks
+                             (e.g. handlers for notify_finished)
+
+        Requests are transferred from the first set to the second as they complete.
+        
+        We try to block() for 'finishing' requests first, so they can be discarded quickly.
+        (If we didn't block for 'finishing' requests at all, we'd be violating the Request 'Callback Timing Guarantee', 
+        which must hold for both Requests and RequestPools.  See Request docs for details.)        
         """
+        def _clear_finishing_requests():
+            while self._finishing_requests:
+                try:
+                    req = self._finishing_requests.pop()
+                except KeyError:
+                    break
+                else:
+                    req.block()            
+        
         if not self._started:
             self.submit()
-        for req in self._requests:
-            req.block()
+        
+        while self._requests:
+            # First, clear the queue of 'finishing' requests.
+            # We want to discard them as soon as possible.
+            _clear_finishing_requests()
+            
+            # Next, wait for the next non-'finishing' request.
+            try:
+                req = self._requests.pop()
+            except KeyError:
+                # the _requests set was modified in the mean time
+                # we can quit the loop since there are no more requests
+                break
+            else:
+                req.block()
+
+        # Finally, now all the requests are either 'finishing' or totally complete.
+        # DON'T EXIT until all requests are totally complete. 
+        #  (Once their callbacks have completed, they are no longer 'finishing')
+        _clear_finishing_requests()
 
     def cancel(self):
         """

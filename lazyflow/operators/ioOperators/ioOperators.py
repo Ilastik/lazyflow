@@ -1,40 +1,42 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
-#Python
-from functools import partial
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 import os
 import math
 import logging
 import glob
-import copy
-from itertools import product, chain
-from collections import deque, OrderedDict
+from collections import OrderedDict
 logger = logging.getLogger(__name__)
 traceLogger = logging.getLogger('TRACE.' + __name__)
 
-from lazyflow.utility.bigRequestStreamer import BigRequestStreamer
-from lazyflow.roi import roiFromShape
+import psutil
 
-#SciPy
-import vigra,numpy,h5py
+import numpy
+import vigra
 
-#lazyflow
 from lazyflow.graph import OrderedSignal, Operator, OutputSlot, InputSlot
-from lazyflow.roi import roiToSlice
+from lazyflow.roi import roiToSlice, roiFromShape, determineBlockShape
+from lazyflow.utility.bigRequestStreamer import BigRequestStreamer
+from lazyflow.request import Request 
+
 
 class OpStackLoader(Operator):
     """Imports an image stack.
@@ -183,13 +185,29 @@ class OpStackWriter(Operator):
         tagged_sliceshape[self._volume_axes[0]] = 1
         slice_shape = (tagged_sliceshape.values())
 
-        # Use a request streamer to automatically request a constant batch of 4 active requests.
+        parallel_requests = 4
+
+        # If ram usage info is available, make a better guess about how many requests we can launch in parallel
+        ram_usage_per_requested_pixel = self.Input.meta.ram_usage_per_requested_pixel
+        if ram_usage_per_requested_pixel is not None:
+            pixels_per_slice = numpy.prod(slice_shape)
+            if 'c' in tagged_sliceshape:
+                pixels_per_slice /= tagged_sliceshape['c']
+            
+            ram_usage_per_slice = pixels_per_slice * ram_usage_per_requested_pixel
+
+            # Fudge factor: Reduce RAM usage by a bit
+            available_ram = psutil.virtual_memory().available
+            available_ram *= 0.5
+
+            parallel_requests = int(available_ram / ram_usage_per_slice)
+
         streamer = BigRequestStreamer( self.Input,
                                        roiFromShape( self.Input.meta.shape ),
                                        slice_shape,
-                                       batchSize=4 )
+                                       parallel_requests )
 
-        # Write the slices as they come in (possibly out-of-order, but probably not.        
+        # Write the slices as they come in (possibly out-of-order, but probably not)
         streamer.resultSignal.subscribe( self._write_slice )
         streamer.progressSignal.subscribe( self.progressSignal )
 
@@ -212,7 +230,7 @@ class OpStackWriter(Operator):
         # Test to make sure the filepath pattern includes slice index field        
         filepath_pattern = self.FilepathPattern.value
         assert '123456789' in filepath_pattern.format( slice_index=123456789 ), \
-            "Output filepath pattern must contain the '{slice_index}' field for formatting.\n"\
+            "Output filepath pattern must contain the '{{slice_index}}' field for formatting.\n"\
             "Your format was: {}".format( filepath_pattern )
 
     # No output slots...
@@ -286,6 +304,9 @@ class OpStackToH5Writer(Operator):
         self.WriteImage.setDirty(slice(None))
 
     def execute(self, slot, subindex, roi, result):
+        if not self.opStackLoader.fileNameList:
+            raise Exception( "Didn't find any files to combine.  Is the glob string valid?  globstring = {}".format( self.GlobString.value ) )
+        
         # Copy the data image-by-image
         stackTags = self.opStackLoader.stack.meta.axistags
         zAxis = stackTags.index('z')
@@ -405,42 +426,27 @@ class OpH5WriterBigDataset(Operator):
                 g = self.f.create_group(hdf5GroupName)
 
         dataShape=self.Image.meta.shape
-        taggedShape = self.Image.meta.getTaggedShape()
+        self.logger.info( "Data shape: {}".format(dataShape))
+
         dtype = self.Image.meta.dtype
         if type(dtype) is numpy.dtype:
             # Make sure we're dealing with a type (e.g. numpy.float64),
             #  not a numpy.dtype
             dtype = dtype.type
-
-        numChannels = 1
-        if 'c' in taggedShape:
-            numChannels = taggedShape['c']
-
-        # Set up our chunk shape: Aim for a cube that's roughly 300k in size
+        # Set up our chunk shape: Aim for a cube that's roughly 512k in size
         dtypeBytes = dtype().nbytes
-        cubeDim = math.pow( 300000 / (numChannels * dtypeBytes), (1/3.0) )
-        cubeDim = int(cubeDim)
 
-        chunkDims = {}
-        chunkDims['t'] = 1
-        chunkDims['x'] = cubeDim
-        chunkDims['y'] = cubeDim
-        chunkDims['z'] = cubeDim
-        chunkDims['c'] = numChannels
+        tagged_maxshape = self.Image.meta.getTaggedShape()
+        if 't' in tagged_maxshape:
+            # Assume that chunks should not span multiple t-slices
+            tagged_maxshape['t'] = 1
         
-        # h5py guide to chunking says chunks of 300k or less "work best"
-        assert chunkDims['x'] * chunkDims['y'] * chunkDims['z'] * numChannels * dtypeBytes  <= 300000
+        self.chunkShape = determineBlockShape( tagged_maxshape.values(), 512000.0 / dtypeBytes )
 
-        chunkShape = ()
-        for i in range( len(dataShape) ):
-            axisKey = self.Image.meta.axistags[i].key
-            # Chunk shape can't be larger than the data shape
-            chunkShape += ( min( chunkDims[axisKey], dataShape[i] ), )
-
-        self.chunkShape = chunkShape
         if datasetName in g.keys():
             del g[datasetName]
-        kwargs = { 'shape' : dataShape, 'dtype' : dtype, 'chunks' : self.chunkShape }
+        kwargs = { 'shape' : dataShape, 'dtype' : dtype,
+            'chunks' : self.chunkShape }
         if self.CompressionEnabled.value:
             kwargs['compression'] = 'gzip' # <-- Would be nice to use lzf compression here, but that is h5py-specific.
             kwargs['compression_opts'] = 1 # <-- Optimize for speed, not disk space.
@@ -452,50 +458,19 @@ class OpH5WriterBigDataset(Operator):
     def execute(self, slot, subindex, rroi, result):
         self.progressSignal(0)
         
-        slicings=self.computeRequestSlicings()
-        numSlicings = len(slicings)
-
-        self.logger.debug( "Dividing work into {} pieces".format( len(slicings) ) )
-
-        # Throttle: Only allow 10 outstanding requests at a time.
-        # Otherwise, the whole set of requests can be outstanding and use up ridiculous amounts of memory.        
-        activeRequests = deque()
-        activeSlicings = deque()
-        # Start by activating 10 requests 
-        for i in range( min(10, len(slicings)) ):
-            s = slicings.pop()
-            activeSlicings.append(s)
-            self.logger.debug( "Creating request for slicing {}".format(s) )
-            activeRequests.append( self.inputs["Image"][s] )
-        
-        counter = 0
-
-        while len(activeRequests) > 0:
-            # Wait for a request to finish
-            req = activeRequests.popleft()
-            s=activeSlicings.popleft()
-            data = req.wait()
-            if data.flags.c_contiguous:
-                self.d.write_direct(data.view(numpy.ndarray), dest_sel=s)
-            else:
-                self.d[s] = data
-            
-            req.clean() # Discard the data in the request and allow its children to be garbage collected.
-
-            if len(slicings) > 0:
-                # Create a new active request
-                s = slicings.pop()
-                activeSlicings.append(s)
-                activeRequests.append( self.inputs["Image"][s] )
-            
-            # Since requests finish in an arbitrary order (but we always block for them in the same order),
-            # this progress feedback will not be smooth.  It's the best we can do for now.
-            self.progressSignal( 100*counter/numSlicings )
-            self.logger.debug( "request {} out of {} executed".format( counter, numSlicings ) )
-            counter += 1
-
         # Save the axistags as a dataset attribute
         self.d.attrs['axistags'] = self.Image.meta.axistags.toJSON()
+
+        def handle_block_result(roi, data):
+            slicing = roiToSlice(*roi)
+            if data.flags.c_contiguous:
+                self.d.write_direct(data.view(numpy.ndarray), dest_sel=slicing)
+            else:
+                self.d[slicing] = data
+        requester = BigRequestStreamer( self.Image, roiFromShape( self.Image.meta.shape ) )
+        requester.resultSignal.subscribe( handle_block_result )
+        requester.progressSignal.subscribe( self.progressSignal )
+        requester.execute()            
 
         # Be paranoid: Flush right now.
         self.f.file.flush()
@@ -504,34 +479,6 @@ class OpH5WriterBigDataset(Operator):
         result[0] = True
 
         self.progressSignal(100)
-
-    def computeRequestSlicings(self):
-        #TODO: reimplement the request better
-        shape=numpy.asarray(self.inputs['Image'].meta.shape)
-
-        chunkShape = numpy.asarray(self.chunkShape)
-
-        # Choose a request shape that is a multiple of the chunk shape
-        axistags = self.Image.meta.axistags
-        multipliers = { 'x':5, 'y':5, 'z':5, 't':1, 'c':100 } # For most problems, there is little advantage to breaking up the channels.
-        multiplier = [multipliers[tag.key] for tag in axistags ]
-        shift = chunkShape * numpy.array(multiplier)
-        shift=numpy.minimum(shift,shape)
-        start=numpy.asarray([0]*len(shape))
-
-        stop=shift
-        reqList=[]
-
-        #shape = shape - (numpy.mod(numpy.asarray(shape),
-        #                  shift))
-
-        for indices in product(*[range(0, stop, step)
-                        for stop,step in zip(shape, shift)]):
-
-            start=numpy.asarray(indices)
-            stop=numpy.minimum(start+shift,shape)
-            reqList.append(roiToSlice(start,stop))
-        return reqList
 
     def propagateDirty(self, slot, subindex, roi):
         # The output from this operator isn't generally connected to other operators.

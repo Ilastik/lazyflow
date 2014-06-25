@@ -1,21 +1,27 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 import copy
 from functools import partial
+import collections
 import numpy
 import vigra
 from lazyflow.graph import Operator, InputSlot, OutputSlot
@@ -30,6 +36,11 @@ class OpReorderAxes(Operator):
         input_order = self.Input.meta.getAxisKeys()
         input_tags = self.Input.meta.axistags
         tagged_input_shape = self.Input.meta.getTaggedShape()
+        
+        tagged_ideal_blockshape = None
+        if self.Input.meta.ideal_blockshape is not None:
+            assert len( input_order) == len(self.Input.meta.ideal_blockshape)
+            tagged_ideal_blockshape = collections.OrderedDict( zip( input_order, self.Input.meta.ideal_blockshape ) )
 
         # Check for errors
         self._invalid_axes = []
@@ -47,13 +58,19 @@ class OpReorderAxes(Operator):
         # Determine output shape/axistags
         output_shape = []
         output_tags = vigra.defaultAxistags(output_order)
+        ideal_blockshape = []
         for a in output_order:
             if a in input_order:
                 output_shape.append(tagged_input_shape[a])
                 # Preserve full AxisInfo for retained axes
                 output_tags[a] = input_tags[a]
+                
+                if tagged_ideal_blockshape:
+                    ideal_blockshape.append( tagged_ideal_blockshape[a] )
             else:
                 output_shape.append(1)
+                if tagged_ideal_blockshape:
+                    ideal_blockshape.append(1)
 
         self.Output.meta.assignFrom( self.Input.meta )
         self.Output.meta.axistags = output_tags
@@ -62,6 +79,8 @@ class OpReorderAxes(Operator):
             self.Output.meta.original_axistags = copy.copy(input_tags)
             self.Output.meta.original_shape = self.Input.meta.shape
             assert len(input_tags) == len(self.Input.meta.shape)
+        if tagged_ideal_blockshape:
+            self.Output.meta.ideal_blockshape = ideal_blockshape
 
         # These map between input axis indexes and output axis indexes
         # (Used to translate between input/output rois in execute() and propagateDirty())

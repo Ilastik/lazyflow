@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 import json
 import re
 import collections
@@ -125,6 +130,27 @@ class FormattedField(object):
 
         # TODO: Also validate that all format fields the user provided are known required/optional fields.
         return x    
+
+class RoiTuple(object):
+    """
+    Callale that serves as a pseudo-type.
+    Converts a nested list to a roi tuple.
+    """
+    
+    def __call__(self, x):
+        if not isinstance(x, (list, tuple)) or \
+           len(x) != 2 or \
+           not isinstance(x[0], (list, tuple)) or \
+           not isinstance(x[1], (list, tuple)) or \
+           len(x[0]) != len(x[1]):
+            raise JsonConfigParser.ParsingError( "json value is not a valid roi: {}".format( x ) )
+        
+        # Are all values ints?
+        for a in x[0] + x[1]:
+            if not isinstance(a, int):
+                raise JsonConfigParser.ParsingError( "roi contains non-integers: {}".format( x ) )
+        
+        return ( tuple(x[0]), tuple(x[1]) )
 
 class JsonConfigEncoder( json.JSONEncoder ):
     """

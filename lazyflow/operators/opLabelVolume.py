@@ -1,6 +1,8 @@
 
 from threading import Lock as ThreadLock
 from functools import partial
+from abc import ABCMeta, abstractmethod, abstractproperty
+import logging
 
 import numpy as np
 import vigra
@@ -12,14 +14,7 @@ from lazyflow.metaDict import MetaDict
 from lazyflow.request import Request, RequestPool
 from lazyflow.operators import OpCompressedCache, OpReorderAxes
 
-# try to import the blockedarray module, fail only if neccessary
-try:
-    import blockedarray
-except ImportError as e:
-    _blockedarray_module_available = False
-    _importMsg = str(e)
-else:
-    _blockedarray_module_available = True
+logger = logging.getLogger(__name__)
 
 
 ## OpLabelVolume - the **unified** connected components operator
@@ -29,7 +24,8 @@ else:
 class OpLabelVolume(Operator):
 
     ## provide the volume to label here
-    # (arbitrary shape, dtype could be restricted #TODO)
+    # (arbitrary shape, dtype could be restricted, see the implementations
+    # property supportedDtypes below)
     Input = InputSlot()
 
     ## provide labels that are treated as background
@@ -46,20 +42,30 @@ class OpLabelVolume(Operator):
     # currently available:
     # * 'vigra': use the fast algorithm from ukoethe/vigra
     # * 'blocked': use the memory saving algorithm from thorbenk/blockedarray
+    #
+    # A change here deletes all previously cached results.
     Method = InputSlot(value='vigra')
 
     ## Labeled volume
     # Axistags and shape are the same as on the Input, dtype is an integer
     # datatype.
-    # Note: The output might be cached internally depending on the chosen CC
-    # method, use the CachedOutput to avoid duplicate caches. (see inner
-    # operator below for details)
+    # This slot operates on a what-you-request-is-what-you-get basis, if you
+    # request a subregion only that subregion will be considered for labeling
+    # and no internal caches are used. If you want consistent labels for
+    # subsequent requests, use CachedOutput instead.
+    # This slot will be set dirty by time and channel if the background or the
+    # input changes for the respective time-channel-slice.
     Output = OutputSlot()
 
     ## Cached label image
-    # Access the internal cache. If you were planning to cache the labeled
-    # volume, be sure to use this slot, since it makes use of the internal
-    # cache that might be in use anyway.
+    # Axistags and shape are the same as on the Input, dtype is an integer
+    # datatype.
+    # This slot extends the ROI to the full xyz volume (c and t are unaffected)
+    # and computes the labeling for the whole volume. As long as the input does
+    # not get dirty, subsequent requests to this slot guarantee consistent
+    # labelings. The internal cache in use is an OpCompressedCache.
+    # This slot will be set dirty by time and channel if the background or the
+    # input changes for the respective time-channel-slice.
     CachedOutput = OutputSlot()
 
     name = "OpLabelVolume"
@@ -105,7 +111,7 @@ class OpLabelVolume(Operator):
         self._op5_2_cached.Input.connect(self._opLabel.CachedOutput)
 
         # set the final reordering operator's AxisOrder to that of the input
-        origOrder = "".join([s for s in self.Input.meta.getTaggedShape()])
+        origOrder = self.Input.meta.getAxisKeys()
         self._op5_2.AxisOrder.setValue(origOrder)
         self._op5_2_cached.AxisOrder.setValue(origOrder)
 
@@ -115,7 +121,7 @@ class OpLabelVolume(Operator):
     def propagateDirty(self, slot, subindex, roi):
         if slot == self.Method:
             # We are changing the labeling method. In principle, the labelings
-            # are equivalent, but not neccessary the same!
+            # are equivalent, but not necessarily the same!
             self.Output.setDirty(slice(None))
         elif slot == self.Input:
             # handled by internal operator
@@ -145,6 +151,8 @@ class OpLabelVolume(Operator):
 
 ## parent class for all connected component labeling implementations
 class OpLabelingABC(Operator):
+    __metaclass__ = ABCMeta
+
     ## input with axes 'xyzct'
     Input = InputSlot()
 
@@ -154,49 +162,44 @@ class OpLabelingABC(Operator):
     Output = OutputSlot()
     CachedOutput = OutputSlot()
 
+    # the numeric type that is used for labeling
+    labelType = np.uint32
+
+    ## list of supported dtypes
+    @abstractproperty
+    def supportedDtypes(self):
+        pass
+
     def __init__(self, *args, **kwargs):
         super(OpLabelingABC, self).__init__(*args, **kwargs)
-        self._cache = None
-        self._metaProvider = _OpMetaProvider(parent=self)
-
-    def setupOutputs(self):
-        labelType = np.uint32
-
-        # remove unneeded old cache
-        if self._cache is not None:
-            self._cache.Input.disconnect()
-            del self._cache
-
-        m = self.Input.meta
-        self._metaProvider.setMeta(
-            MetaDict({'shape': m.shape, 'dtype': labelType,
-                      'axistags': m.axistags}))
-
         self._cache = OpCompressedCache(parent=self)
         self._cache.name = "OpLabelVolume.OutputCache"
-        self._cache.Input.connect(self._metaProvider.Output)
-        shape = np.asarray(self.Input.meta.shape)
+        self._cache.Input.connect(self.Output)
+        self.CachedOutput.connect(self._cache.Output)
+
+    def setupOutputs(self):
+
+        # check if the input dtype is valid
+        if self.Input.ready():
+            dtype = self.Input.meta.dtype
+            if dtype not in self.supportedDtypes:
+                msg = "{}: dtype '{}' not supported "\
+                    "with method 'vigra'. Supported types: {}"
+                msg = msg.format(self.name, dtype, self.supportedDtypes)
+                raise ValueError(msg)
+
+        # set cache chunk shape to the whole spatial volume
+        shape = np.asarray(self.Input.meta.shape, dtype=np.int)
         shape[3:5] = 1
         self._cache.BlockShape.setValue(tuple(shape))
-        self.Output.meta.assignFrom(self._cache.Output.meta)
-        self.CachedOutput.meta.assignFrom(self._cache.Output.meta)
 
-        s = self.Input.meta.getTaggedShape()
-        shape = (s['c'], s['t'])
-        self._cached = np.zeros(shape)
-
-        # prepare locks for each channel and time slice
-        locks = np.empty(shape, dtype=np.object)
-        for c in range(s['c']):
-            for t in range(s['t']):
-                locks[c, t] = ThreadLock()
-        self._locks = locks
+        # setup meta for Output
+        self.Output.meta.assignFrom(self.Input.meta)
+        self.Output.meta.dtype = self.labelType
 
     def propagateDirty(self, slot, subindex, roi):
         # a change in either input or background makes the whole
         # time-channel-slice dirty (CCL is a global operation)
-        self._cached[roi.start[3]:roi.stop[3],
-                     roi.start[4]:roi.stop[4]] = 0
         outroi = roi.copy()
         outroi.start[:3] = (0, 0, 0)
         outroi.stop[:3] = self.Input.meta.shape[:3]
@@ -204,7 +207,14 @@ class OpLabelingABC(Operator):
         self.CachedOutput.setDirty(outroi)
 
     def execute(self, slot, subindex, roi, result):
-        #FIXME we don't care right now which slot is requested, just return cached CC
+        if slot == self.Output:
+            # just label the ROI and write it to result
+            self._label(roi, result)
+        else:
+            raise ValueError("Request to unknown slot {}".format(slot))
+
+    def _label(self, roi, result):
+        result = vigra.taggedView(result, axistags=self.Output.meta.axistags)
         # get the background values
         bg = self.Background[...].wait()
         bg = vigra.taggedView(bg, axistags=self.Background.meta.axistags)
@@ -216,170 +226,83 @@ class OpLabelingABC(Operator):
         # do labeling in parallel over channels and time slices
         pool = RequestPool()
 
-        for t in range(roi.start[4], roi.stop[4]):
-            for c in range(roi.start[3], roi.stop[3]):
-                # only one thread may update the cache for this c and t, other requests
-                # must wait until labeling is finished
-                self._locks[c, t].acquire()
-                if self._cached[c, t]:
-                    # this slice is already computed
-                    continue
-                # update the whole slice
-                req = Request(partial(self._updateSlice, c, t, bg[c, t]))
+        start = np.asarray(roi.start, dtype=np.int)
+        stop = np.asarray(roi.stop, dtype=np.int)
+        for ti, t in enumerate(range(roi.start[4], roi.stop[4])):
+            start[4], stop[4] = t, t+1
+            for ci, c in enumerate(range(roi.start[3], roi.stop[3])):
+                start[3], stop[3] = c, c+1
+                newRoi = SubRegion(self.Output,
+                                   start=tuple(start), stop=tuple(stop))
+                resView = result[..., ci, ti].withAxes(*'xyz')
+                req = Request(partial(self._label3d, newRoi,
+                                      bg[c, t], resView))
                 pool.add(req)
 
+        logger.debug(
+            "{}: Computing connected components for ROI {} ...".format(
+                self.name, roi))
         pool.wait()
         pool.clean()
+        logger.debug("{}: Connected components computed.".format(
+            self.name))
 
-        req = self._cache.Output.get(roi)
-        req.writeInto(result)
-        req.block()
-
-        # release locks and set caching flags
-        for t in range(roi.start[4], roi.stop[4]):
-            for c in range(roi.start[3], roi.stop[3]):
-                self._cached[c, t] = 1
-                self._locks[c, t].release()
-
-    ## compute the requested slice and put the results into self._cache
+    ## compute the requested roi and put the results into result
     #
-    def _updateSlice(self, c, t, bg):
-        raise NotImplementedError("This is an abstract method")
+    # @param result the array to write into, 3d xyz
+    @abstractmethod
+    def _label3d(self, roi, bg, result):
+        pass
 
 
 ## vigra connected components
 class _OpLabelVigra(OpLabelingABC):
     name = "OpLabelVigra"
+    supportedDtypes = [np.uint8, np.uint32, np.float32]
 
-    def setupOutputs(self):
-        if self.Input.ready():
-            supportedDtypes = [np.uint8, np.uint32, np.float32]
-            dtype = self.Input.meta.dtype
-            if dtype not in supportedDtypes:
-                msg = "OpLabelVolume: dtype '{}' not supported "\
-                    "with method 'vigra'. Supported types: {}"
-                msg = msg.format(dtype, supportedDtypes)
-                raise ValueError(msg)
-        super(_OpLabelVigra, self).setupOutputs()
-
-    def _updateSlice(self, c, t, bg):
-        source = vigra.taggedView(self.Input[..., c, t].wait(),
-                                  axistags='xyzct')
-        source = source.withAxes(*'xyz')
-        result = vigra.analysis.labelVolumeWithBackground(
-            source, background_value=int(bg))
-        result = result.withAxes(*'xyzct')
-
-        stop = np.asarray(self.Input.meta.shape)
-        start = 0*stop
-        start[3:] = (c, t)
-        stop[3:] = (c+1, t+1)
-        roi = SubRegion(self._cache.Input, start=start, stop=stop)
-
-        self._cache.setInSlot(self._cache.Input, (), roi, result)
+    def _label3d(self, roi, bg, result):
+        source = vigra.taggedView(self.Input.get(roi).wait(),
+                                  axistags='xyzct').withAxes(*'xyz')
+        if source.shape[2] > 1:
+            result[:] = vigra.analysis.labelVolumeWithBackground(
+                source, background_value=int(bg))
+        else:
+            result[..., 0] = vigra.analysis.labelImageWithBackground(
+                source[..., 0], background_value=int(bg))
 
 
-## blockedarray connected components
-class _OpLabelBlocked(OpLabelingABC):
+# try to import the blockedarray module, fail only if neccessary
+try:
+    from blockedarray import OpBlockedConnectedComponents
+    raise ImportError("blockedarray not supported")
+except ImportError as e:
+    _blockedarray_module_available = False
+    _importMsg = str(e)
+    class OpBlockedConnectedComponents(object):
+        pass
+else:
+    _blockedarray_module_available = True
+    _importMsg = "No error, importing blockedarray worked."
+
+def haveBlocked():
+    return _blockedarray_module_available
+
+
+## Wrapper for blockedarray.OpBlockedConnectedComponents
+# This wrapper takes care that the module is indeed imported, and sets the
+# block shape for the cache.
+# TODO this operator does not conform to OpLabelingABC
+class _OpLabelBlocked(OpBlockedConnectedComponents):
     name = "OpLabelBlocked"
 
     def _updateSlice(self, c, t, bg):
         assert _blockedarray_module_available,\
-            "Failed to import blockedarray: {}".format(_importMsg)
-        assert bg == 0,\
-            "Blocked Labeling not implemented for background value {}".format(bg)
+            "Failed to import blockedarray. Message was: {}".format(_importMsg)
 
-        blockShape = _findBlockShape(self.Input.meta.shape[:3])
-
-        source = _Source(self.Input, blockShape, c, t)
-        sink = _Sink(self._cache, c, t)
-        cc = blockedarray.dim3.ConnectedComponents(source, blockShape)
-        cc.writeToSink(sink)
-
-
-## Feeds meta data into OpCompressedCache
-#
-# This operator is needed because we
-#   - don't connect OpCompressedCache directly to a real InputSlot
-#   - feed data to cache by setInSlot()
-class _OpMetaProvider(Operator):
-    Output = OutputSlot()
-
-    def __init__(self, *args, **kwargs):
-        # Configure output with given metadata.
-        super(_OpMetaProvider, self).__init__(*args, **kwargs)
-
-    def setupOutputs(self):
-        pass
-
-    def execute(self, slot, subindex, roi, result):
-        assert False,\
-            "The cache asked for data which should not happen."
-
-    def setMeta(self, meta):
-        self.Output.meta.assignFrom(meta)
-
-
-if _blockedarray_module_available:
-
-    def fullRoiFromPQ(slot, p, q, c, t):
-        fullp = np.zeros((5,), dtype=np.int)
-        fullq = np.zeros((5,), dtype=np.int)
-        fullp[:3] = p
-        fullq[:3] = q
-        fullp[3] = c
-        fullp[4] = t
-        fullq[3] = c+1
-        fullq[4] = t+1
-        return SubRegion(slot, start=fullp, stop=fullq)
-
-    class _Source(blockedarray.adapters.SourceABC):
-        def __init__(self, slot, blockShape, c, t):
-            super(_Source, self).__init__()
-            self._slot = slot
-            self._blockShape = blockShape  # is passed to blockedarray!
-            self._p = np.asarray(slot.meta.shape[:3], dtype=np.long)*0
-            self._q = np.asarray(slot.meta.shape[:3], dtype=np.long)
-            self._c = c
-            self._t = t
-
-        def pySetRoi(self, roi):
-            assert len(roi) == 2
-            self._p = np.asarray(roi[0], dtype=np.long)
-            self._q = np.asarray(roi[1], dtype=np.long)
-
-        def pyShape(self):
-            return tuple(self._slot.meta.shape[:3])
-
-        def pyReadBlock(self, roi, output):
-            assert len(roi) == 2
-            roiP = np.asarray(roi[0])
-            roiQ = np.asarray(roi[1])
-            p = self._p + roiP
-            q = p + roiQ - roiP
-            if np.any(q > self._q):
-                raise IndexError("Requested roi is too large for selected "
-                                 "roi (previous call to setRoi)")
-            sub = fullRoiFromPQ(self._slot, p, q, self._c, self._t)
-            req = self._slot.get(sub)
-            req.writeInto(output[..., np.newaxis, np.newaxis])
-            req.block()
-            return True
-
-    class _Sink(blockedarray.adapters.SinkABC):
-        def __init__(self, op, c, t):
-            super(_Sink, self).__init__()
-            self._op = op
-            self._c = c
-            self._t = t
-
-        def pyWriteBlock(self, roi, block):
-            assert len(roi) == 2
-            roiP = np.asarray(roi[0])
-            roiQ = np.asarray(roi[1])
-            sub = fullRoiFromPQ(self._op.Input, roiP, roiQ, self._c, self._t)
-            self._op.setInSlot(self._op.Input, (), sub,
-                               block[..., np.newaxis, np.newaxis])
+        blockShape = _findBlockShape(self.Input.meta.shape[:3]) + (1, 1)
+        logger.debug("{}: Using blockshape {}".format(self.name, blockShape))
+        self._cache.BlockShape.setValue(blockShape)
+        super(_OpLabelBlocked, self)._updateSlice(c, t, bg)
 
 
 ## find a good block shape for given input shape

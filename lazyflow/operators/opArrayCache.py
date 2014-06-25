@@ -1,23 +1,30 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 #Python
+import sys
 import time
 import weakref
 import itertools
+import collections
 from threading import Lock
 import logging
 logger = logging.getLogger(__name__)
@@ -140,22 +147,25 @@ class OpArrayCache(OpCache):
                 if freed > 0:
                     self.logger.debug("OpArrayCache: freed cache of shape:{}".format(fshape))
     
-                    self._lock.acquire()
-                    self._blockState[:] = OpArrayCache.DIRTY
-                    del self._cache
-                    self._cache = None
-                    self._lock.release()
+                    with self._lock:
+                        self._blockState[:] = OpArrayCache.DIRTY
+                        del self._cache
+                        self._cache = None
             return freed
 
+    def _get_full_blockshape(self, input_blockshape):
+        max_shape = self.Input.meta.shape
+        if not isinstance(input_blockshape, collections.Iterable):
+            # Broadcast as a tuple
+            blockshape = (input_blockshape,)*len(max_shape)
+        else:
+            blockshape = tuple( input_blockshape )
+        blockshape = numpy.minimum(blockshape, max_shape)
+        return tuple(blockshape)
+    
     def _allocateManagementStructures(self):
         shape = self.Output.meta.shape
-        if type(self._origBlockShape) != tuple:
-            self._blockShape = (self._origBlockShape,)*len(shape)
-        else:
-            self._blockShape = self._origBlockShape
-    
-        self._blockShape = numpy.minimum(self._blockShape, shape)
-    
+        self._blockShape = self._get_full_blockshape(self._origBlockShape)    
         self._dirtyShape = numpy.ceil(1.0 * numpy.array(shape) / numpy.array(self._blockShape)).astype(numpy.int)
     
         self.logger.debug("Configured OpArrayCache with shape={}, blockShape={}, dirtyShape={}, origBlockShape={}".format(shape, self._blockShape, self._dirtyShape, self._origBlockShape))
@@ -163,7 +173,7 @@ class OpArrayCache(OpCache):
         #if a request has been submitted to get a block, the request object
         #is stored within this array
         self._blockQuery = numpy.ndarray(self._dirtyShape, dtype=object)
-       
+        
         #keep track of the dirty state of each block
         self._blockState = OpArrayCache.DIRTY * numpy.ones(self._dirtyShape, numpy.uint8)
     
@@ -187,7 +197,6 @@ class OpArrayCache(OpCache):
     def setupOutputs(self):
         self.CleanBlocks.meta.shape = (1,)
         self.CleanBlocks.meta.dtype = object
-        
 
         reconfigure = False
         if  self.inputs["fixAtCurrent"].ready():
@@ -195,21 +204,39 @@ class OpArrayCache(OpCache):
 
         if self.inputs["blockShape"].ready() and self.inputs["Input"].ready():
             newBShape = self.inputs["blockShape"].value
+            assert numpy.issubdtype(type(newBShape), numpy.integer) or all( map(lambda x: numpy.issubdtype(type(x), numpy.integer), newBShape) )
             if self._origBlockShape != newBShape and self.inputs["Input"].ready():
                 reconfigure = True
             self._origBlockShape = newBShape
             self._blockShape = newBShape
             
             inputSlot = self.inputs["Input"]
-            self.outputs["Output"].meta.assignFrom(inputSlot.meta)
+            self.Output.meta.assignFrom(inputSlot.meta)
+
+            # Estimate ram usage            
+            ram_per_pixel = 0
+            if self.Output.meta.dtype == object or self.Output.meta.dtype == numpy.object_:
+                ram_per_pixel = sys.getsizeof(None)
+            elif numpy.issubdtype(self.Output.meta.dtype, numpy.dtype):
+                ram_per_pixel = self.Output.meta.dtype().nbytes
+            
+            tagged_shape = self.Output.meta.getTaggedShape()
+            if 'c' in tagged_shape:
+                ram_per_pixel *= float(tagged_shape['c'])
+
+            if self.Output.meta.ram_usage_per_requested_pixel is not None:
+                ram_per_pixel = max( ram_per_pixel, self.Output.meta.ram_usage_per_requested_pixel )
+
+            self.Output.meta.ram_usage_per_requested_pixel = ram_per_pixel
 
         shape = self.Output.meta.shape
-        if reconfigure and shape is not None:
-            self._lock.acquire()
-            self._allocateManagementStructures()
-            if not self._lazyAlloc:
-                self._allocateCache()
-            self._lock.release()
+        if (self._dirtyShape is None or reconfigure) and shape is not None:
+            with self._lock:
+                self._allocateManagementStructures()
+                if not self._lazyAlloc:
+                    self._allocateCache()
+
+        self.Output.meta.ideal_blockshape = self._get_full_blockshape(self._origBlockShape)
 
     def propagateDirty(self, slot, subindex, roi):
         shape = self.Output.meta.shape
@@ -285,101 +312,98 @@ class OpArrayCache(OpCache):
         shape = self.Output.meta.shape
         start, stop = sliceToRoi(key, shape)
 
-        self._lock.acquire()
-
-        ch = self._cacheHits
-        ch += 1
-        self._cacheHits = ch
-
-        self._running += 1
-
-        if self._cache is None:
-            self._allocateCache()
-
-        cacheView = self._cache[:] #prevent freeing of cache during running this function
-
-
-        blockStart = (1.0 * start / self._blockShape).floor()
-        blockStop = (1.0 * stop / self._blockShape).ceil()
-        blockKey = roiToSlice(blockStart,blockStop)
-
-        blockSet = self._blockState[blockKey]
-
-        # this is a little optimization to shortcut
-        # many lines of python code when all data is
-        # is already in the cache:
-        if numpy.logical_or(blockSet == OpArrayCache.CLEAN, blockSet == OpArrayCache.FIXED_DIRTY).all():
-            result[:] = self._cache[roiToSlice(start, stop)]
-            self._running -= 1
-            self._updatePriority()
-            cacheView = None
-            self._lock.release()
-            return
-
-        inProcessQueries = numpy.unique(numpy.extract( blockSet == OpArrayCache.IN_PROCESS, self._blockQuery[blockKey]))
-
-        cond = (blockSet == OpArrayCache.DIRTY)
-        tileWeights = fastWhere(cond, 1, 128**3, numpy.uint32)
-        trueDirtyIndices = numpy.nonzero(cond)
-
-        tileArray = drtile.test_DRTILE(tileWeights, 128**3).swapaxes(0,1)
-
-        dirtyRois = []
-        half = tileArray.shape[0]/2
-        dirtyPool = RequestPool()
-
-        for i in range(tileArray.shape[1]):
-
-            drStart3 = tileArray[:half,i]
-            drStop3 = tileArray[half:,i]
-            drStart2 = drStart3 + blockStart
-            drStop2 = drStop3 + blockStart
-            drStart = drStart2*self._blockShape
-            drStop = drStop2*self._blockShape
-
-            shape = self.Output.meta.shape
-            drStop = numpy.minimum(drStop, shape)
-            drStart = numpy.minimum(drStart, shape)
-
-            key3 = roiToSlice(drStart3,drStop3)
-            key2 = roiToSlice(drStart2,drStop2)
-
-            key = roiToSlice(drStart,drStop)
-
+        with self._lock:
+            ch = self._cacheHits
+            ch += 1
+            self._cacheHits = ch
+    
+            self._running += 1
+    
+            if self._cache is None:
+                self._allocateCache()
+    
+            cacheView = self._cache[:] #prevent freeing of cache during running this function
+    
+    
+            blockStart = (1.0 * start / self._blockShape).floor()
+            blockStop = (1.0 * stop / self._blockShape).ceil()
+            blockKey = roiToSlice(blockStart,blockStop)
+    
+            blockSet = self._blockState[blockKey]
+    
+            # this is a little optimization to shortcut
+            # many lines of python code when all data is
+            # is already in the cache:
+            if numpy.logical_or(blockSet == OpArrayCache.CLEAN, blockSet == OpArrayCache.FIXED_DIRTY).all():
+                result[:] = self._cache[roiToSlice(start, stop)]
+                self._running -= 1
+                self._updatePriority()
+                cacheView = None
+                return
+    
+            inProcessQueries = numpy.unique(numpy.extract( blockSet == OpArrayCache.IN_PROCESS, self._blockQuery[blockKey]))
+    
+            cond = (blockSet == OpArrayCache.DIRTY)
+            tileWeights = fastWhere(cond, 1, 128**3, numpy.uint32)
+            trueDirtyIndices = numpy.nonzero(cond)
+    
+            tileArray = drtile.test_DRTILE(tileWeights, 128**3).swapaxes(0,1)
+    
+            dirtyRois = []
+            half = tileArray.shape[0]/2
+            dirtyPool = RequestPool()
+    
+            for i in range(tileArray.shape[1]):
+    
+                drStart3 = tileArray[:half,i]
+                drStop3 = tileArray[half:,i]
+                drStart2 = drStart3 + blockStart
+                drStop2 = drStop3 + blockStart
+                drStart = drStart2*self._blockShape
+                drStop = drStop2*self._blockShape
+    
+                shape = self.Output.meta.shape
+                drStop = numpy.minimum(drStop, shape)
+                drStart = numpy.minimum(drStart, shape)
+    
+                key3 = roiToSlice(drStart3,drStop3)
+                key2 = roiToSlice(drStart2,drStop2)
+    
+                key = roiToSlice(drStart,drStop)
+    
+                if not self._fixed:
+                    dirtyRois.append([drStart,drStop])
+    
+                    req = self.inputs["Input"][key].writeInto(self._cache[key])
+    
+                    req.uncancellable = True #FIXME
+                    
+                    dirtyPool.add(req)
+    
+                    self._blockQuery[key2] = weakref.ref(req)
+    
+                    #sanity check:
+                    if (self._blockState[key2] != OpArrayCache.DIRTY).any():
+                        logger.warning( "original condition" + str(cond) )
+                        logger.warning( "original tilearray {} {}".format( tileArray, tileArray.shape ) )
+                        logger.warning( "original tileWeights {} {}".format( tileWeights, tileWeights.shape ) )
+                        logger.warning( "sub condition {}".format( self._blockState[key2] == OpArrayCache.DIRTY ) )
+                        logger.warning( "START={}, STOP={}".format( drStart2, drStop2 ) )
+                        import h5py
+                        with h5py.File("test.h5", "w") as f:
+                            f.create_dataset("data",data = tileWeights)
+                            logger.warning( "%r \n %r \n %r\n %r\n %r \n%r" % (key2, blockKey,self._blockState[key2], self._blockState[blockKey][trueDirtyIndices],self._blockState[blockKey],tileWeights) )
+                        assert False
+                    self._blockState[key2] = OpArrayCache.IN_PROCESS
+    
+            # indicate the inprocessing state, by setting array to 0 (i.e. IN_PROCESS)
             if not self._fixed:
-                dirtyRois.append([drStart,drStop])
-
-                req = self.inputs["Input"][key].writeInto(self._cache[key])
-
-                req.uncancellable = True #FIXME
-                
-                dirtyPool.add(req)
-
-                self._blockQuery[key2] = weakref.ref(req)
-
-                #sanity check:
-                if (self._blockState[key2] != OpArrayCache.DIRTY).any():
-                    logger.warning( "original condition" + str(cond) )
-                    logger.warning( "original tilearray {} {}".format( tileArray, tileArray.shape ) )
-                    logger.warning( "original tileWeights {} {}".format( tileWeights, tileWeights.shape ) )
-                    logger.warning( "sub condition {}".format( self._blockState[key2] == OpArrayCache.DIRTY ) )
-                    logger.warning( "START={}, STOP={}".format( drStart2, drStop2 ) )
-                    import h5py
-                    with h5py.File("test.h5", "w") as f:
-                        f.create_dataset("data",data = tileWeights)
-                        logger.warning( "%r \n %r \n %r\n %r\n %r \n%r" % (key2, blockKey,self._blockState[key2], self._blockState[blockKey][trueDirtyIndices],self._blockState[blockKey],tileWeights) )
-                    assert False
-                self._blockState[key2] = OpArrayCache.IN_PROCESS
-
-        # indicate the inprocessing state, by setting array to 0 (i.e. IN_PROCESS)
-        if not self._fixed:
-            blockSet[:]  = fastWhere(cond, OpArrayCache.IN_PROCESS, blockSet, numpy.uint8)
-        else:
-            # Someone asked for some dirty blocks while we were fixed.
-            # Mark these blocks to be signaled as dirty when we become unfixed
-            blockSet[:]  = fastWhere(cond, OpArrayCache.FIXED_DIRTY, blockSet, numpy.uint8)
-            self._has_fixed_dirty_blocks = True
-        self._lock.release()
+                blockSet[:]  = fastWhere(cond, OpArrayCache.IN_PROCESS, blockSet, numpy.uint8)
+            else:
+                # Someone asked for some dirty blocks while we were fixed.
+                # Mark these blocks to be signaled as dirty when we become unfixed
+                blockSet[:]  = fastWhere(cond, OpArrayCache.FIXED_DIRTY, blockSet, numpy.uint8)
+                self._has_fixed_dirty_blocks = True
 
         temp = itertools.count(0)
 
@@ -409,16 +433,14 @@ class OpArrayCache(OpCache):
         inProcessPool.clean()
 
         # finally, store results in result area
-        self._lock.acquire()
-        if self._cache is not None:
-            result[:] = self._cache[roiToSlice(start, stop)]
-        else:
-            self.inputs["Input"][roiToSlice(start, stop)].writeInto(result).wait()
-        self._running -= 1
-        self._updatePriority()
-        cacheView = None
-
-        self._lock.release()
+        with self._lock:
+            if self._cache is not None:
+                result[:] = self._cache[roiToSlice(start, stop)]
+            else:
+                self.inputs["Input"][roiToSlice(start, stop)].writeInto(result).wait()
+            self._running -= 1
+            self._updatePriority()
+            cacheView = None
         self.logger.debug("read %s took %f sec." % (roi.pprint(), time.time()-t))
 
     def setInSlot(self, slot, subindex, roi, value):
@@ -437,13 +459,12 @@ class OpArrayCache(OpCache):
             stop2 = blockStop * self._blockShape
             stop2 = numpy.minimum(stop2, self.Output.meta.shape)
             key2 = roiToSlice(start2,stop2)
-            self._lock.acquire()
-            if self._cache is None:
-                self._allocateCache()
-            self._cache[key2] = value[roiToSlice(start2-start,stop2-start)]
-            self._blockState[blockKey] = self._dirtyState
-            self._blockQuery[blockKey] = None
-            self._lock.release()
+            with self._lock:
+                if self._cache is None:
+                    self._allocateCache()
+                self._cache[key2] = value[roiToSlice(start2-start,stop2-start)]
+                self._blockState[blockKey] = self._dirtyState
+                self._blockQuery[blockKey] = None
 
     def _executeCleanBlocks(self, slot, subindex, roi, destination):
         indexCols = numpy.where(self._blockState == OpArrayCache.CLEAN)

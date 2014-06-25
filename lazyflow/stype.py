@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 import numpy, vigra
 import warnings
 
@@ -177,8 +182,8 @@ class ArrayLike( SlotType ):
         if isinstance(result, numpy.ndarray):
             assert len(roi.start) == result.ndim, "check_result_valid: result has wrong number of dimensions (%d instead of %d)" % (result.ndim, len(roi.start))
             for d in range(result.ndim):
-                s = roi.stop[d] - roi.start[d]
-                assert result.shape[d] == s, "check_result_valid: result has wrong shape (%d instead of %d) for dimension %d" % (result.shape[d], s, d)
+                assert (result.shape == (roi.stop - roi.start)).all(), \
+                    "check_result_valid: result has wrong shape.  Got {}, expected {}".format( result.shape, roi.stop - roi.start )
         elif isinstance(result, list):
             s = roi.stop[0] - roi.start[0]
             assert len(result) == s, "check_result_valid: result has wrong shape (%d instead of %d) for dimension %d" % (result.shape[d], s, d)

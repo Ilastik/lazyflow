@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 import gc
 import sys
 import numpy
@@ -46,7 +51,8 @@ class TestBigRequestStreamer(object):
         resultsCount = [0]
         
         def handleResult(roi, result):
-            assert resultslock.acquire(False), "resultslock is contested! Access to callback is supposed to be automatically serialized."
+            acquired = resultslock.acquire(False)
+            assert acquired, "resultslock is contested! Access to callback is supposed to be automatically serialized."
             results[ roiToSlice( *roi ) ] = result
             logger.debug( "Got result for {}".format(roi) )
             resultslock.release()
@@ -88,7 +94,7 @@ class TestBigRequestStreamer(object):
 
             def setupOutputs(self):
                 self.Output.meta.dtype = numpy.float32
-                self.Output.shape = (2000, 2000, 2000)
+                self.Output.meta.shape = (2000, 2000, 2000)
     
             def execute(self, slot, subindex, roi, result):
                 """

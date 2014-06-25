@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 import os
 import tempfile
 import shutil
@@ -24,12 +29,12 @@ import vigra
 
 from lazyflow.graph import Graph
 from lazyflow.utility import PathComponents
-from lazyflow.operators.operators import OpArrayCache
+from lazyflow.operators.operators import OpArrayCache, OpArrayPiper
 from lazyflow.operators.opReorderAxes import OpReorderAxes
 from lazyflow.operators.ioOperators import OpInputDataReader, OpExportSlot, OpStackLoader
 
 try:
-    import dvidclient
+    import pydvid
     from mockserver.h5mockserver import H5MockServerDataFile, H5MockServer
     _skip_dvid = False
 except ImportError:
@@ -50,8 +55,11 @@ class TestOpExportSlot(object):
         data = vigra.taggedView( data, vigra.defaultAxistags('xy') )
         
         graph = Graph()
+        opPiper = OpArrayPiper(graph=graph)
+        opPiper.Input.setValue( data )
+
         opExport = OpExportSlot(graph=graph)
-        opExport.Input.setValue(data)
+        opExport.Input.connect( opPiper.Output )
         opExport.OutputFormat.setValue( 'hdf5' )
         opExport.OutputFilenameFormat.setValue( self._tmpdir + '/test_export_x{x_start}-{x_stop}_y{y_start}-{y_stop}' )
         opExport.OutputInternalPath.setValue('volume/data')
@@ -76,8 +84,11 @@ class TestOpExportSlot(object):
         data = vigra.taggedView( data, vigra.defaultAxistags('xy') )
         
         graph = Graph()
+        opPiper = OpArrayPiper(graph=graph)
+        opPiper.Input.setValue( data )
+
         opExport = OpExportSlot(graph=graph)
-        opExport.Input.setValue(data)
+        opExport.Input.connect( opPiper.Output )
         opExport.OutputFormat.setValue( 'npy' )
         opExport.OutputFilenameFormat.setValue( self._tmpdir + '/test_export_x{x_start}-{x_stop}_y{y_start}-{y_stop}' )
         opExport.CoordinateOffset.setValue( (10, 20) )
@@ -113,8 +124,12 @@ class TestOpExportSlot(object):
             data = vigra.taggedView( data, vigra.defaultAxistags('xyc') )
             
             graph = Graph()
+            
+            opPiper = OpArrayPiper(graph=graph)
+            opPiper.Input.setValue( data )
+            
             opExport = OpExportSlot(graph=graph)
-            opExport.Input.setValue( data )
+            opExport.Input.connect( opPiper.Output )
             opExport.OutputFormat.setValue( 'dvid' )
             url = 'http://localhost:8000/api/node/{data_uuid}/{data_name}'.format( **locals() )
             opExport.OutputFilenameFormat.setValue( url )

@@ -1,23 +1,30 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 import os
 import collections
 
 import numpy
+import psutil
+
 import vigra
 
 from lazyflow.graph import Operator, InputSlot
@@ -32,7 +39,7 @@ class OpExportMultipageTiff(Operator):
                         # Re-order the axes yourself if you want an alternative slicing direction
     Filepath = InputSlot()
 
-    BATCH_SIZE = 4
+    DEFAULT_BATCH_SIZE = 4
 
     def __init__(self, *args, **kwargs):
         super(OpExportMultipageTiff, self).__init__(*args, **kwargs)
@@ -67,9 +74,26 @@ class OpExportMultipageTiff(Operator):
 
         tagged_shape = self.Input.meta.getTaggedShape()
 
+        parallel_requests = self.DEFAULT_BATCH_SIZE
+        
+        # If ram usage info is available, make a better guess about how many requests we can launch in parallel
+        ram_usage_per_requested_pixel = self.Input.meta.ram_usage_per_requested_pixel
+        if ram_usage_per_requested_pixel is not None:
+            pixels_per_slice = numpy.prod(slice_shape)
+            if 'c' in tagged_sliceshape:
+                pixels_per_slice /= tagged_sliceshape['c']
+            
+            ram_usage_per_slice = pixels_per_slice * ram_usage_per_requested_pixel
+
+            # Fudge factor: Reduce RAM usage by a bit
+            available_ram = psutil.virtual_memory().available
+            available_ram *= 0.5
+
+            parallel_requests = int(available_ram / ram_usage_per_slice)
+        
         # Start with a batch of images
         reqs = collections.deque()
-        for slice_index in range( min(self.BATCH_SIZE, tagged_shape[step_axis]) ):
+        for slice_index in range( min(parallel_requests, tagged_shape[step_axis]) ):
             reqs.append( create_slice_req( slice_index ) )
         
         self.progressSignal(0)

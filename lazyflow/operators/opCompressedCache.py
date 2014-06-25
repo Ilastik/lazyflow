@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 # Built-in
 import copy
 import logging
@@ -344,8 +349,8 @@ class OpCompressedCache(OpCache):
     def _setInSlotInput(self, slot, subindex, roi, value, store_zero_blocks=True):
         """
         Write the data in the array 'value' into the cache.
-        If the optional ignore_zero_blocks param is True, then don't bother 
-        creating cache blocks for blocks thare are totally zero.
+        If the optional store_zero_blocks param is False, then don't bother 
+        creating cache blocks for blocks that are totally zero.
         """
         assert len(roi.stop) == len(self.Input.meta.shape), \
             "roi: {} has the wrong number of dimensions for Input shape: {}"\

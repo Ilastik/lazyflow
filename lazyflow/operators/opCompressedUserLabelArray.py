@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 # Built-in
 import logging
 
@@ -66,9 +71,12 @@ class OpCompressedUserLabelArray(OpCompressedCache):
         # Overwrite the blockshape
         if self._blockshape is None:
             self._blockshape = numpy.minimum( self.BlockShape.value, self.Output.meta.shape )
-        else:
-            assert self.blockShape.value == self._blockshape, \
-                "Not allowed to change the blockshape after initial setup"
+        elif self.blockShape.value != self._blockshape:
+            nonzero_blocks_destination = [None]
+            self._execute_nonzeroBlocks(nonzero_blocks_destination)
+            nonzero_blocks = nonzero_blocks_destination[0]
+            if len(nonzero_blocks) > 0:
+                raise RuntimeError( "You are not permitted to reconfigure the labeling operator after you've already stored labels in it." )
 
         # Overwrite chunkshape now that blockshape has been overwritten
         self._chunkshape = self._chooseChunkshape(self._blockshape)
@@ -122,10 +130,7 @@ class OpCompressedUserLabelArray(OpCompressedCache):
         if slot == self.Output:
             self._executeOutput(roi, destination)
         elif slot == self.nonzeroBlocks:
-            stored_block_rois = self.CleanBlocks.value
-            block_slicings = map( lambda block_roi: roiToSlice(*block_roi), stored_block_rois )
-            destination[0] = block_slicings
-            return
+            self._execute_nonzeroBlocks(destination)
         else:
             return super( OpCompressedUserLabelArray, self ).execute( slot, subindex, roi, destination )
 
@@ -140,6 +145,13 @@ class OpCompressedUserLabelArray(OpCompressedCache):
         block_starts = getIntersectingBlocks( self._blockshape, (roi.start, roi.stop) )
         self._copyData(roi, destination, block_starts)
         return destination
+
+    def _execute_nonzeroBlocks(self, destination):
+        stored_block_rois_destination = [None]
+        self._executeCleanBlocks( stored_block_rois_destination )
+        stored_block_rois = stored_block_rois_destination[0]
+        block_slicings = map( lambda block_roi: roiToSlice(*block_roi), stored_block_rois )
+        destination[0] = block_slicings
 
     def _copyData(self, roi, destination, block_starts):
         """

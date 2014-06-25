@@ -1,19 +1,24 @@
+###############################################################################
+#   lazyflow: data flow based lazy parallel computation framework
+#
+#       Copyright (C) 2011-2014, the ilastik developers
+#                                <team@ilastik.org>
+#
 # This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# modify it under the terms of the Lesser GNU General Public License
+# as published by the Free Software Foundation; either version 2.1
 # of the License, or (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# GNU Lesser General Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software Foundation,
-# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-#
-# Copyright 2011-2014, the ilastik developers
-
+# See the files LICENSE.lgpl2 and LICENSE.lgpl3 for full text of the
+# GNU Lesser General Public License version 2.1 and 3 respectively.
+# This information is also available on the ilastik web site at:
+#		   http://ilastik.org/license/
+###############################################################################
 import threading
 from functools import partial
 
@@ -136,26 +141,34 @@ class RoiRequestBatch( object ):
         """
         self.progressSignal( 0 )
 
-        with self._condition:
+        ## In the lines below, we acquire/release self._condition with high frequency,
+        ## to allow finishing requests to be handled in _handleCompletedRequest as soon as possible,
+        ## instead of forcing them to wait for the entire batch to be launched before the first 
+        ## finished request can be handled and discarded.
+
+        try:
             # Start by activating a batch of N requests
             for _ in range(self._batchSize):
-                self._activateNewRequest()
-                self._activated_count += 1
+                with self._condition:
+                    self._activateNewRequest()
+                    self._activated_count += 1
 
-            try:
-                # Loop until StopIteration
-                while True:
-                    # Wait for at least one active request to finish
+            # Loop until StopIteration
+            while True:
+                # Wait for at least one active request to finish
+                with self._condition:
                     while (self._activated_count - self._completed_count) == self._batchSize:
                         self._condition.wait()
 
-                    # Launch new requests until we have the correct number of active requests
-                    while self._activated_count - self._completed_count < self._batchSize:
+                # Launch new requests until we have the correct number of active requests
+                while self._activated_count - self._completed_count < self._batchSize:
+                    with self._condition:
                         self._activateNewRequest() # Eventually raises StopIteration
                         self._activated_count += 1
-            except StopIteration:
-                # We've run out of requests to launch.
-                # Wait for the remaining active requests to finish.
+        except StopIteration:
+            # We've run out of requests to launch.
+            # Wait for the remaining active requests to finish.
+            with self._condition:
                 while self._completed_count < self._activated_count:
                     self._condition.wait()
 
