@@ -7,14 +7,15 @@ logger = logging.getLogger(__name__)
 
 import h5py
 import re
+import numpy as np
 
 
 class OpExportToKnime(Operator):
     
     name = "Knime Export"
-    
+
     RawImage = InputSlot()
-    #CCImage = InputSlot()
+    LabelImage = InputSlot()
     
     ObjectFeatures = InputSlot(rtype=List, stype=Opaque)
     SelectedFeatures = InputSlot(rtype=List, stype=Opaque)
@@ -24,8 +25,9 @@ class OpExportToKnime(Operator):
     
     WriteData = OutputSlot(stype='bool', rtype=List)
     
-    def __init__(self, *args, **kwargs):
+    def __init__(self, settings, *args, **kwargs):
         super(OpExportToKnime, self).__init__(*args, **kwargs)
+        self.settings = settings
         
     def setupOutputs(self):
         self.WriteData.meta.shape = (1,)
@@ -33,14 +35,7 @@ class OpExportToKnime(Operator):
     
     def propagateDirty(self, slot, subindex, roi): 
         pass
-    
-    def write_to_hdf5(self, filename, table):
-        #with h5py.File(filename, "w") as fout:
-        import pprint
-        print "\n\n\nTABLE\n\n"
-        pp = pprint.PrettyPrinter(indent=4)
-        pp.pprint(table)
-        
+
     def write_to_csv(self, table):
         pass
 
@@ -81,17 +76,68 @@ class OpExportToKnime(Operator):
         wanted_table = table[new_names]
         wanted_table.dtype.names = clean_names
 
+        obj_num = wanted_table.shape[0]
+        max_id_len = len(str(obj_num))
+        paths = np.zeros((obj_num,), dtype="q,a10,a10")
+        paths.dtype.names = ("Object id", "Image path", "Labeling path")
+        paths["Object id"] = wanted_table["Object id"]
         with h5py.File(filename, "w") as fout:
             fout["tables/FeatureTable"] = wanted_table
-            fout["tables/ImagePathTable"] = "NOTHING"
-            max_id_len = len(str(len(wanted_table["Object id"])-1))
-            for obj in wanted_table["Object id"]:
-                folder = str(obj).zfill(max_id_len)
-                fout["images/%s/labels" % folder] = "NOTHING (LABELS)"
-                if not inc_raw:
-                    fout["images/%s/raw" % folder] = "NOTHING (RAW)"
-            if inc_raw:
-                fout["images/raw"] = "NOTHING (RAW)"
 
+            if inc_raw:
+                fout["images/raw"] = self.RawImage([]).wait().squeeze()
+                fout["images/labeling"] = self.RawImage([]).wait().squeeze()
+
+                for i in xrange(obj_num):
+                    paths[i][1] = "images/raw"
+                    paths[i][2] = "images/labeling"
+
+            else:
+                coords = self._get_coords(wanted_table)
+                for i in xrange(obj_num):
+                    oid = wanted_table["Object id"][i]
+                    folder = str(oid).zfill(max_id_len)
+                    path = "images/%s/%%s" % folder
+                    paths[i][1] = path % "raw"
+                    paths[i][2] = path % "labeling"
+                    slicing = coords.next()
+                    raw = self.RawImage[slicing].wait()
+                    labeling = self.LabelImage[slicing].wait()
+                    if self.settings["normalize"]:
+                        normalize = np.vectorize(lambda p: 1 if p == oid else 0)
+                        labeling = normalize(labeling)
+
+                    fout[path % "raw"] = raw.squeeze()
+                    fout[path % "labeling"] = labeling.squeeze()
+            fout["tables/ImagePathTable"] = paths
 
         result[0] = True
+
+    def _get_coords(self, table):
+        margin = self.settings["margin"]
+        dimensions = self.settings["dimensions"]
+        assert margin >= 0, "Margin muss be greater than or equal to 0"
+        time = table["Time"].astype(np.int32)
+        minx = table["Coord<Minimum>_ch_0"].astype(np.int32)
+        maxx = table["Coord<Maximum>_ch_0"].astype(np.int32)
+        miny = table["Coord<Minimum>_ch_1"].astype(np.int32)
+        maxy = table["Coord<Maximum>_ch_1"].astype(np.int32)
+        try:
+            minz = table["Coord<Minimum>_ch_2"].astype(np.int32)
+            maxz = table["Coord<Maximum>_ch_2"].astype(np.int32)
+        except ValueError:
+            minz = maxz = None
+        for i in xrange(table.shape[0]):
+            yield [
+                slice(time[i], time[i]+1),
+                slice(max(0, minx[i] - margin),
+                      min(maxx[i] + margin, dimensions[1])),
+                slice(max(0, miny[i] - margin),
+                      min(maxy[i] + margin, dimensions[2])),
+            ] + ([] if minz is None else [
+                slice(max(0, minz[i] - margin),
+                      min(maxz[i] + margin, dimensions[3])),
+            ]) + [
+                slice(0, 1)
+            ]
+
