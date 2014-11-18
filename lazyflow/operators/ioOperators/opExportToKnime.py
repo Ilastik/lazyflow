@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 import h5py
 import re
 import numpy as np
-from operator import itemgetter
+
 
 class OpExportToKnime(Operator):
     
@@ -32,7 +32,63 @@ class OpExportToKnime(Operator):
         self.feature_table = None
         self.feature_selection = None
         self.bar = bar
-        
+
+    def _create_feature_table(self):
+        computed_features = self.ObjectFeatures([]).wait()
+        selection = self.SelectedFeatures([]).wait()
+        feature_names = []
+        feature_cats = []
+        feature_channels = []
+        feature_types = []
+        for cat_name, category in computed_features[0].iteritems():
+            for feat_name, feat_array in category.iteritems():
+                if cat_name == "Default features" or \
+                        feat_name not in feature_names and \
+                        feat_name in selection:
+                    feature_names.append(feat_name)
+                    feature_cats.append(cat_name)
+                    feature_channels.append(feat_array.shape[1])
+                    feature_types.append(feat_array.dtype)
+
+        obj_count = []
+        for time in computed_features.iterkeys():
+            obj_count.append(computed_features[time]["Default features"]["Count"].shape[0])
+
+        channel_name = ["x", "y", "z"]
+        dtype_names = ["Object id", "Time"]
+        dtype_types = ["q", "q"]
+        dtype_to_key = {}
+        for i, name in enumerate(feature_names):
+            if feature_channels[i] > 1:
+                for j in xrange(feature_channels[i]):
+                    dtype_names.append("%s_%s" % (name, channel_name[j]))
+                    dtype_types.append(feature_types[i].name)
+                    dtype_to_key[dtype_names[-1]] = (feature_cats[i], name, j)
+            else:
+                dtype_names.append(name)
+                dtype_types.append(feature_types[i].name)
+                dtype_to_key[dtype_names[-1]] = (feature_cats[i], name, 0)
+
+        self.feature_table = np.zeros((sum(obj_count),), dtype=",".join(dtype_types))
+        self.feature_table.dtype.names = map(str, dtype_names)
+
+        start = 0
+        end = obj_count[0]
+        for time in computed_features.iterkeys():
+            for name in dtype_names[2:]:
+                cat, feat_name, index = dtype_to_key[name]
+                self.feature_table[name][start:end] = computed_features[time][cat][feat_name][:, index]
+            self.feature_table["Time"][start:end] = int(time)
+            start = end
+            try:
+                end += obj_count[int(time) + 1]
+            except IndexError:
+                end = -1
+
+        logger.info("Object feature table created")
+        self.bar.finish_step()
+
+
     def setupOutputs(self):
         self.WriteData.meta.shape = (1,)
         self.WriteData.meta.dtype = object
@@ -46,9 +102,8 @@ class OpExportToKnime(Operator):
     def execute(self, slot, subindex, roi, result):
         assert slot == self.WriteData
 
-        self.feature_table = self.ObjectFeatures.value
-        self.feature_selection = self.SelectedFeatures.value
-        self._filter_features()
+        self._create_feature_table()
+
         if self.settings["force unique ids"]:
             self._force_unique_ids()
 
@@ -62,40 +117,34 @@ class OpExportToKnime(Operator):
 
         compression = self.settings["compression"]
 
-        multiframe = self.RawImage.meta["shape"][0] > 1
         with h5py.File(filename, "w") as fout:
             self._make_dset(fout, "tables/FeatureTable", self.feature_table, compression)
 
             if self.IncludeRawImage.value:
                 self._make_dset(fout, "images/raw", self.RawImage([]).wait().squeeze(), compression)
-                self.bar.update_step(33)
-                self._make_dset(fout, "images/labeling", self.LabelImage([]).wait().squeeze(), compression)
-                self.bar.update_step(66)
-
+                self.bar.update_step(50)
                 for i in xrange(obj_num):
                     paths[i][1] = "images/raw"
-                    paths[i][2] = "images/labeling"
 
-            else:
-                for i, slicing in enumerate(self._get_coords()):
-                    oid = self.feature_table["Object id"][i]
-                    folder_id = str(oid).zfill(max_id_len)
-                    if multiframe:
-                        time = self.feature_table["Time"][i]
-                        path = "images/%s/%s/%%s" % (time, folder_id)
-                    else:
-                        path = "images/%s/%%s" % folder_id
+            for i, slicing in enumerate(self._get_coords()):
+                oid = self.feature_table["Object id"][i]
+                folder_id = str(i).zfill(max_id_len)
+                path = "images/%s/%%s" % folder_id
+                if not self.IncludeRawImage.value:
                     paths[i][1] = path % "raw"
-                    paths[i][2] = path % "labeling"
                     raw = self.RawImage[slicing].wait()
-                    labeling = self.LabelImage[slicing].wait()
-                    if self.settings["normalize"]:
-                        normalize = np.vectorize(lambda p: 1 if p == oid else 0)
-                        labeling = normalize(labeling)
-
                     self._make_dset(fout, path % "raw", raw.squeeze(), compression)
-                    self._make_dset(fout, path % "labeling", labeling.squeeze(), compression)
-                    self.bar.update_step(float(i)/obj_num)
+
+                paths[i][2] = path % "labeling"
+                labeling = self.LabelImage[slicing].wait()
+                if self.settings["normalize"]:
+                    id_ = i if self.settings["force unique ids"] else oid
+                    normalize = np.vectorize(lambda p: 1 if p == id_ else 0)
+                    labeling = normalize(labeling)
+                self._make_dset(fout, path % "labeling", labeling.squeeze(), compression)
+
+                self.bar.update_step(float(i)/obj_num)
+
             self._make_dset(fout, "tables/ImagePathTable", paths, compression)
         self.bar.update_step(100)
         self.bar.finish_step()
