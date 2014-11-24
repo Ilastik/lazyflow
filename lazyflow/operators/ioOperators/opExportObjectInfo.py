@@ -97,7 +97,7 @@ class OpExportObjectInfo(Operator):
 
         obj_count = []
         for time in computed_features.iterkeys():
-            obj_count.append(computed_features[time]["Default features"]["Count"].shape[0])
+            obj_count.append(computed_features[time]["Default features"]["Count"].shape[0] - 1)
 
         channel_name = ["x", "y", "z"]
         dtype_names = ["image id", "object id", "time"]
@@ -124,7 +124,7 @@ class OpExportObjectInfo(Operator):
         for time in computed_features.iterkeys():
             for name in dtype_names[3:-2]:
                 cat, feat_name, index = dtype_to_key[name]
-                self.feature_table[name][start:end] = computed_features[time][cat][feat_name][:, index]
+                self.feature_table[name][start:end] = computed_features[time][cat][feat_name][1:, index]
             self.feature_table["time"][start:end] = int(time)
             start = end
             try:
@@ -211,13 +211,13 @@ class OpExportObjectInfo(Operator):
                         "type": "image",
                         "axistags": vigra.AxisTags(actual_atags).toJSON(),
                     }
-                    self._make_dset(fout, path % "raw", raw.squeeze(), compression, meta)
+                    self._make_dset(fout, path % "raw", raw.astype("float32").squeeze(), compression, meta)
                 else:
                     labeling_slicing = slicing
                 self.feature_table[i]["labels"] = (path % "labels")[7:]
                 labeling = self.LabelImage[labeling_slicing].wait()
                 if self.settings["normalize"]:
-                    id_ = i if self.settings["force unique ids"] else oid
+                    id_ = i + 1 if self.settings["force unique ids"] else oid
                     normalize = np.vectorize(lambda p: 1 if p == id_ else 0)
                     labeling = normalize(labeling).view("uint64")
                     labeling.dtype = np.uint64
