@@ -97,11 +97,11 @@ class OpExportObjectInfo(Operator):
 
         obj_count = []
         for time in computed_features.iterkeys():
-            obj_count.append(computed_features[time]["Default features"]["Count"].shape[0] - 1)
+            obj_count.append(computed_features[time]["Default features"]["Count"].shape[0] - 1)  # no bgrd
 
         channel_name = ["x", "y", "z"]
-        dtype_names = ["image id", "object id", "time"]
-        dtype_types = ["I", "I", "I"]
+        dtype_names = ["image id", "object id", "ilastik id", "time"]
+        dtype_types = ["I", "I", "I", "I"]
         dtype_to_key = {}
         for i, name in enumerate(feature_names):
             if feature_channels[i] > 1:
@@ -122,15 +122,19 @@ class OpExportObjectInfo(Operator):
         start = 0
         end = obj_count[0]
         for time in computed_features.iterkeys():
-            for name in dtype_names[3:-2]:
+            for name in dtype_names[4:-2]:  # ignore ids/time at start and paths at end
                 cat, feat_name, index = dtype_to_key[name]
-                self.feature_table[name][start:end] = computed_features[time][cat][feat_name][1:, index]
+                self.feature_table[name][start:end] = computed_features[time][cat][feat_name][1:, index]  # no bgrd
             self.feature_table["time"][start:end] = int(time)
+            self.feature_table["ilastik id"][start:end] = range(1, end - start + 1)
             start = end
             try:
                 end += obj_count[int(time) + 1]
             except IndexError:
                 end = sum(obj_count)
+
+        self.feature_table["object id"] = range(0, sum(obj_count))
+        self.feature_table["image id"] = range(0, sum(obj_count))
 
         logger.debug("Feature table ready")
 
@@ -148,9 +152,6 @@ class OpExportObjectInfo(Operator):
 
         self._create_feature_table()
 
-        if self.settings["force unique ids"]:
-            self._force_unique_ids()
-
         filename = unicode(self.settings["file path"])
 
         if self.settings["file type"] == "h5":
@@ -162,12 +163,12 @@ class OpExportObjectInfo(Operator):
 
     def _export_to_csv(self, result, filename):
         with open(filename, "w") as fout:
-            line = ",".join(self.feature_table.dtype.names)
+            line = ",".join(self.feature_table.dtype.names[:-2])
             fout.write(line)
             fout.write("\n")
 
             for row in self.feature_table:
-                line = ",".join(map(str, row))
+                line = ",".join(map(str, row[:-2]))
                 fout.write(line)
                 fout.write("\n")
         self.emitter.finish()
@@ -176,14 +177,14 @@ class OpExportObjectInfo(Operator):
     def _export_to_h5(self, result, filename):
 
         obj_num = self.feature_table.shape[0]
-        max_id_len = len(str(obj_num))
-
         compression = self.settings["compression"]
 
         with h5py.File(filename, "w") as fout:
 
             raw_axistags = self.RawImage.meta.axistags
             labeling_axistags = self.LabelImage.meta.axistags
+
+            # adding whole raw image
             if self.settings["include raw"]:
                 meta = {
                     "type": "image",
@@ -193,15 +194,17 @@ class OpExportObjectInfo(Operator):
                 self._make_dset(fout, "images/raw", raw.squeeze(), compression, meta)
                 self.feature_table["raw"] = ["raw"] * obj_num
 
+                # coordinates for the rois
                 coords = self._get_coords(labeling_axistags)
             else:
                 coords = izip(self._get_coords(raw_axistags), self._get_coords(labeling_axistags))
 
+            max_id_len = len(str(self.feature_table.shape[0]))
             for i, slicing in enumerate(coords):
-                oid = self.feature_table["object id"][i]
-                #folder_id = str(i).zfill(max_id_len)
-                folder_id = str(i)
+                folder_id = str(i).zfill(max_id_len)
                 path = "images/%s/%%s" % folder_id
+
+                # add raw rois
                 if not self.settings["include raw"]:
                     raw_slicing, labeling_slicing = slicing
                     self.feature_table[i]["raw"] = (path % "raw")[7:]
@@ -214,13 +217,16 @@ class OpExportObjectInfo(Operator):
                     self._make_dset(fout, path % "raw", raw.astype("float32").squeeze(), compression, meta)
                 else:
                     labeling_slicing = slicing
+
+                # add labeling rois
                 self.feature_table[i]["labels"] = (path % "labels")[7:]
                 labeling = self.LabelImage[labeling_slicing].wait()
+
                 if self.settings["normalize"]:
-                    id_ = i + 1 if self.settings["force unique ids"] else oid
-                    normalize = np.vectorize(lambda p: 1 if p == id_ else 0)
+                    normalize = np.vectorize(lambda p: 1 if p == self.feature_table[i]["ilastik id"] else 0)
                     labeling = normalize(labeling).view("uint64")
                     labeling.dtype = np.uint64
+
                 actual_atags = [labeling_axistags[j] for j, shape in enumerate(labeling.shape) if shape > 1]
                 meta = {
                     "type": "labeling",
@@ -233,11 +239,6 @@ class OpExportObjectInfo(Operator):
             self._make_dset(fout, "table", self.feature_table, compression)
         self.emitter.finish()
         result[0] = True
-
-    def _force_unique_ids(self):
-        obj_num = self.feature_table.shape[0]
-        self.feature_table["object id"] = range(0, obj_num)
-        self.feature_table["image id"] = range(0, obj_num)
 
     @staticmethod
     def _make_dset(fout, path, data, compression, meta=None):
