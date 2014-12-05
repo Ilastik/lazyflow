@@ -1,6 +1,5 @@
 import vigra
 from PyQt4.QtCore import pyqtSignal, QObject
-from PyQt4.QtGui import QApplication
 from lazyflow.graph import Operator, InputSlot, OutputSlot
 from lazyflow.stype import Opaque
 from lazyflow.rtype import List
@@ -15,6 +14,9 @@ from itertools import izip
 
 
 class Emitter(QObject):
+    """
+    Helper Object that allows to use QtSignals in OpExportObjectInfo
+    """
     UpdateProgress = pyqtSignal(int)
     FinishStep = pyqtSignal()
     Busy = pyqtSignal(bool)
@@ -34,8 +36,6 @@ class Emitter(QObject):
     def busy(self, state):
         # noinspection PyCallByClass
         self.Busy.emit(state)
-        # noinspection PyArgumentList
-        QApplication.processEvents()
 
 
 class OpExportObjectInfo(Operator):
@@ -66,6 +66,9 @@ class OpExportObjectInfo(Operator):
         self.emitter = Emitter(bar)
 
     def _create_feature_table(self):
+        """
+        Request the computed features and make a table out of them
+        """
         frames = self.ObjectFeatures.meta.shape[0]
 
         if frames > 1:
@@ -106,7 +109,8 @@ class OpExportObjectInfo(Operator):
         for i, name in enumerate(feature_names):
             if feature_channels[i] > 1:
                 for j in xrange(feature_channels[i]):
-                    dtype_names.append("%s_%s" % (name, channel_name[j]))
+                    c_name = channel_name[j] if feature_channels[i] < len(channel_name) else str(j)
+                    dtype_names.append("%s_%s" % (name, c_name))
                     dtype_types.append(feature_types[i].name)
                     dtype_to_key[dtype_names[-1]] = (feature_cats[i], name, j)
             else:
@@ -148,6 +152,9 @@ class OpExportObjectInfo(Operator):
         pass
 
     def execute(self, slot, subindex, roi, result):
+        """
+        Creates the table and saves the data to csv or h5
+        """
         assert slot == self.WriteData
 
         self._create_feature_table()
@@ -162,20 +169,26 @@ class OpExportObjectInfo(Operator):
             logger.warn("'%s' is not a valid file type!" % self.settings["file type"])
 
     def _export_to_csv(self, result, filename):
+        """
+        Write the feature table to a csv
+        """
+        from itertools import islice
         with open(filename, "w") as fout:
             line = ",".join(self.feature_table.dtype.names[:-2])
             fout.write(line)
             fout.write("\n")
-
             for row in self.feature_table:
-                line = ",".join(map(str, row[:-2]))
+                row = list(islice(row, 0, len(row) - 2))
+                line = ",".join(map(str, row))
                 fout.write(line)
                 fout.write("\n")
         self.emitter.finish()
         result[0] = True
 
     def _export_to_h5(self, result, filename):
-
+        """
+        Write feature table and raw/labeling to h5
+        """
         obj_num = self.feature_table.shape[0]
         compression = self.settings["compression"]
 
@@ -242,6 +255,10 @@ class OpExportObjectInfo(Operator):
 
     @staticmethod
     def _make_dset(fout, path, data, compression, meta=None):
+        """
+        Helper for making datasets in h5
+        If compression failes, no compression is used
+        """
         if meta is None:
             meta = {}
         try:
@@ -253,6 +270,9 @@ class OpExportObjectInfo(Operator):
         return dset
 
     def _get_coords(self, axistags):
+        """
+        Returns an iterator on the slices for each object roi
+        """
         margin = self.settings["margin"]
         dimensions = self.settings["dimensions"]
         assert margin >= 0, "Margin muss be greater than or equal to 0"
