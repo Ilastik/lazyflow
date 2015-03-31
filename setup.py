@@ -28,7 +28,7 @@ setup(
 
     # Project uses reStructuredText, so ensure that the docutils get
     # installed or upgraded on the target machine
-    install_requires = ['greenlet', 'psutil', 'blist', 'h5py'],
+    install_requires = ['greenlet', 'psutil', 'blist', 'h5py', 'numpy'],
 
     package_data = {
         'lazyflow': ['*.txt', '*.py'],
