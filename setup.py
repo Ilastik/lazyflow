@@ -19,30 +19,31 @@
 # This information is also available on the ilastik web site at:
 #		   http://ilastik.org/license/
 ###############################################################################
-from setuptools import setup, find_packages
-setup(
-    name = "lazyflow",
-#    version = "0.1",
-    packages = find_packages(),
-    scripts = [],
 
-    # Project uses reStructuredText, so ensure that the docutils get
-    # installed or upgraded on the target machine
-    install_requires = ['greenlet', 'psutil', 'blist', 'h5py'],
+from os.path import join
+from distutils.core import setup, Extension
+from numpy.distutils.misc_util import get_numpy_include_dirs
 
-    package_data = {
-        'lazyflow': ['*.txt', '*.py'],
-        'lazyflow.drtile': ['drtile.so']
-    },
+drtile = Extension('lazyflow.drtile.drtile',
+                   sources = [join('lazyflow','drtile', 'drtile.cpp')],
+                   libraries  = ['boost_python'],
+                   include_dirs = get_numpy_include_dirs(),
+                   language = 'c++')
 
-    include_package_data = True,    # include everything in source control
+packages = ['lazyflow', 'lazyflow.drtile', 'lazyflow.request',
+            'lazyflow.utility', 'lazyflow.utility.io', 'lazyflow.operators',
+            'lazyflow.operators.ioOperators', 'lazyflow.tools']
 
 
-    # metadata for upload to PyPI
-    author = "Christoph Straehle",
-    author_email = "christoph.straehle@iwr.uni-heidelberg.de",
-    description = "Lazyflow - graph based lazy numpy data flows",
-    license = "BSD",
-    keywords = "graph numpy dataflow",
-    url = "http://ilastik.org/lazyflow",
-)
+setup(name = "lazyflow",
+      version = "0.1",
+      scripts = [join('bin', 'exportRoi.py')],
+      packages = packages,
+      ext_modules = [drtile],
+      install_requires = ['greenlet', 'psutil', 'h5py'],
+      author = "Christoph Straehle",
+      author_email = "christoph.straehle@iwr.uni-heidelberg.de",
+      description = "Lazyflow - graph based lazy numpy data flows",
+      license = "BSD",
+      keywords = "graph numpy dataflow",
+      url = "http://ilastik.org/lazyflow")
