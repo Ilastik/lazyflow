@@ -1,31 +1,25 @@
 language: python
 python:
    - "2.7"
+before_install:
+   # Move out of git directory to build root.
+   - deactivate
+   - cd ../..
+   - pwd
 install:
-   - sudo apt-get install -y libboost-python-dev
-   - sudo apt-get install -y libjpeg-dev
-   - sudo apt-get install -y libtiff4-dev
-   - sudo apt-get install -y libpng12-dev
-   - sudo apt-get install -y libfftw3-dev
-   - sudo apt-get install -y libhdf5-serial-dev
-   - sudo apt-get install -y cmake
-   - pip install -r requirements/development-stage1.txt --use-mirrors
-   - sudo apt-get install -y mercurial
-   - sudo sh .travis_scripts/install_vigra.sh $VIRTUAL_ENV
-   - export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-   - sudo sh .travis_scripts/build_drtile.sh $VIRTUAL_ENV
-   - git submodule init
-   - git submodule update
-   - mkdir ~/.lazyflow
-   - echo "[verbosity]" > ~/.lazyflow/config
-   - echo "deprecation_warnings = false" >> ~/.lazyflow/config
+   # Download and extract the prebuilt binary.
+   - wget -O nanshe-package.tgz https://www.dropbox.com/s/qhy2lhsk0ioge0p/nanshe-package.tgz?dl=0
+   - tar -xzf nanshe-package.tgz
+   - ls
+   # Replace the src in the prebuilt binary with the one TravisCI cloned for us.
+   - rm -rf nanshe-package.tgz
+   - mv nanshe-package/src/ilastik/lazyflow/lazyflow/drtile/drtile.so $TRAVIS_REPO_SLUG/lazyflow/drtile/drtile.so
+   - rm -rf nanshe-package/src/ilastik/lazyflow
+   - mv $TRAVIS_REPO_SLUG nanshe-package/src/ilastik/lazyflow
+   # Won't recognize setup.cfg unless we are in the source directory.
+   - cd nanshe-package/src/ilastik/lazyflow
 script:
-   - nosetests --nologcapture tests
-notifications:
-  email:
-    - bergs@janelia.hhmi.org
-    - bernhard.kausler@iwr.uni-heidelberg.de
-branches:
-  only:
-    - master
-
+   # Run tests. Skip 3D tests as they take too long (~1hr).
+   - ../../../bin/exec.sh ../../../bin/python ../../../bin/nosetests -a '!3D' tests/
+# Use container format for TravisCI to avoid termination due to insufficient resources.
+sudo: false
