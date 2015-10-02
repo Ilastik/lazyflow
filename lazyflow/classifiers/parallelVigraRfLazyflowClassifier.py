@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 class ParallelVigraRfLazyflowClassifierFactory(LazyflowVectorwiseClassifierFactoryABC):
     VERSION = 2 # This is used to determine compatibility of pickled classifier factories.
                 # You must bump this if any instance members are added/removed/renamed.
+                
+    named_importances = None
+    
+    @staticmethod
+    def setNamedImportances(new_named_importances):
+        ParallelVigraRfLazyflowClassifierFactory.named_importances = new_named_importances
+        
+    @staticmethod
+    def getNamedImportances():
+        return ParallelVigraRfLazyflowClassifierFactory.named_importances 
     
     def __init__(self, num_trees_total=100, num_forests=None, variable_importance_path=None, label_proportion=None, variable_importance_enabled=True, **kwargs):      
         """
@@ -115,6 +125,8 @@ class ParallelVigraRfLazyflowClassifierFactory(LazyflowVectorwiseClassifierFacto
             weights /= weights.sum()
     
             named_importances = collections.OrderedDict( zip( feature_names, numpy.average(importances, weights=weights, axis=0) ) )
+            sorted_named_importances = collections.OrderedDict( sorted( named_importances.items(), key=lambda (k,v): v[-2], reverse=True) )  
+            self.setNamedImportances(sorted_named_importances)
             
             importance_table = self._generate_importance_table( named_importances, sort=True )
             
@@ -133,7 +145,7 @@ class ParallelVigraRfLazyflowClassifierFactory(LazyflowVectorwiseClassifierFacto
                     req.notify_finished( partial( store_oob_results, i ) )
                     pool.add( req )
                 pool.wait()  
-                                   
+                       
         logger.info( "Training complete. Average OOB: {}".format( numpy.average(oobs) ) )
         return ParallelVigraRfLazyflowClassifier( forests, oobs, known_labels, feature_names )
 
