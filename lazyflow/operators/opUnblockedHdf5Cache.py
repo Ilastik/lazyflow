@@ -53,10 +53,11 @@ class OpUnblockedHdf5Cache(Operator):
     def __init__(self, dataset_kwargs, *args, **kwargs):
         super( OpUnblockedHdf5Cache, self ).__init__(*args, **kwargs)
         self._lock = RequestLock()
+        self._reader_lock_count = 0
+        self._writer_blocks = {}
         self._h5group = None
         dataset_kwargs = dataset_kwargs or { 'compression' : 'lzf' }
         self._dataset_kwargs = dataset_kwargs
-        self._block_locks = {}
 
     @classmethod
     def _standardize_roi(cls, start, stop):
@@ -67,62 +68,109 @@ class OpUnblockedHdf5Cache(Operator):
         return (start, stop)
 
     def setupOutputs(self):
-        with self._lock:
-            self._h5group = self.H5CacheGroup.value
+        done = False
+        while not done:
+            with self._lock:
+                if self._reader_lock_count == 0:
+                    self._h5group = self.H5CacheGroup.value
+                    done = True
+
         self.Output.meta.assignFrom(self.Input.meta)
     
     def _clear_blocks(self):
+        assert not self._writer_blocks
         keys = self._h5group.keys()
         for k in keys:
             del self._h5group[k]
-        self._block_locks = {}
 
     def execute(self, slot, subindex, roi, result):
-        with self._lock:
-            # Does this roi happen to fit ENTIRELY within an existing stored block?
-            block_rois = map( eval, self._h5group.keys() )
-            outer_rois = containing_rois( block_rois, (roi.start, roi.stop) )
-            if len(outer_rois) > 0:
-                # Use the first one we found
-                block_roi = self._standardize_roi( *outer_rois[0] )
-                block_relative_roi = numpy.array( (roi.start, roi.stop) ) - block_roi[0]
-                
-                self.Output.stype.copy_data(result, self._h5group[str(block_roi)][ roiToSlice(*block_relative_roi) ])
-                return
-                
+        block_is_cached = False
+        has_create_permission = False
+
         # Standardize roi for usage as dict key
         block_roi = self._standardize_roi( roi.start, roi.stop )
-        
-        # Get lock for this block (create first if necessary)
+        block_roi_key = str(block_roi)
+        block_relative_roi = None
+
+        # determine block status (cached or uncached)
         with self._lock:
-            if block_roi not in self._block_locks:
-                self._block_locks[block_roi] = RequestLock()
-            block_lock = self._block_locks[block_roi]
+            if block_roi_key in self._h5group:
+                block_is_cached = True
+                self._reader_lock_count += 1
+            else:
+                # Does this roi happen to fit ENTIRELY within an existing stored block?
+                block_rois = map( eval, self._h5group.keys() )
+                outer_rois = containing_rois( block_rois, (roi.start, roi.stop) )
+                outer_rois_count = len(outer_rois)
+                if outer_rois_count == 1:
+                    block_roi = self._standardize_roi( *outer_rois[0] )
+                    block_roi_key = str(block_roi)
+                    block_relative_roi = numpy.array( (roi.start, roi.stop) ) - block_roi[0]
+                    block_is_cached = True
+                    self._reader_lock_count += 1
+                elif outer_rois_count > 1:
+                    # handle case correctly; or make sure roi is within single block
+                    raise RuntimeError("internal error")
+                elif outer_rois_count == 0:
+                    # handle writer case
+                    if self.Input.meta.dontcache:
+                        has_create_permission = True
+                    elif block_roi_key in self._writer_blocks:
+                        has_create_permission = False
+                    else:
+                        assert not self.Input.meta.dontcache
+                        assert not self._writer_blocks.has_key(block_roi_key)
+                        self._writer_blocks[block_roi_key] = True
+                        has_create_permission = True
 
-        # Handle identical simultaneous requests
-        with block_lock:
-            if str(block_roi) in self._h5group:
-                self.Output.stype.copy_data(result, self._h5group[str(block_roi)])
+        # block exists; read it in
+        if block_is_cached:
+            # multiple readers allowed
+            assert self._reader_lock_count >= 1
+            if block_relative_roi:
+                self.Output.stype.copy_data(result, self._h5group[block_roi_key][ roiToSlice(*block_relative_roi) ])
+            else:
+                self.Output.stype.copy_data(result, self._h5group[block_roi_key])
+
+            # update reader count
+            with self._lock:
+                self._reader_lock_count -= 1
+                assert self._reader_lock_count >= 0
+
+            return
+
+
+        # create data; not yet stored
+        if has_create_permission:
+            # Request data now.
+            self.Input(roi.start, roi.stop).writeInto(result).block()
+
+            # Does upstream operator says don't cache the data? (e.g., OpCacheFixer)
+            if self.Input.meta.dontcache:
                 return
-            else: # Not yet stored: Request it now.
-                # We attach a special attribute to the array to allow the upstream operator
-                #  to optionally tell us not to bother caching the data.
-                self.Input(roi.start, roi.stop).writeInto(result).block()
 
-                if self.Input.meta.dontcache:
-                    # The upstream operator says not to bother caching the data.
-                    # (For example, see OpCacheFixer.)
-                    return
-                
+            # Store the data (wait until there are no readers).
+            while True:
                 with self._lock:
-                    # Store the data.
-                    # First double-check that the block wasn't removed from the 
-                    #   cache while we were requesting it. 
-                    # (Could have happened via propagateDirty() or eventually the arrayCacheMemoryMgr)
-                    if block_roi in self._block_locks:
-                        self._h5group.create_dataset( str(block_roi),
-                                                      data=result,
+                    assert block_roi_key in self._writer_blocks
+
+                    if self._reader_lock_count == 0:
+                        self._h5group.create_dataset( block_roi_key, data=result,
                                                       **self._dataset_kwargs )
+                        self._h5group.file.flush()
+                        del self._writer_blocks[block_roi_key]
+                        return
+
+        else:
+            # delayed read: wait until block is available
+            while True:
+                with self._lock:
+                    if block_roi_key in self._h5group:
+                        assert not self._writer_blocks.has_key(block_roi_key)
+                        self.Output.stype.copy_data(result, self._h5group[block_roi_key])
+                        return
+
+
 
     def propagateDirty(self, slot, subindex, roi):
         maximum_roi = roiFromShape(self.Input.meta.shape)

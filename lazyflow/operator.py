@@ -422,7 +422,9 @@ class Operator(object):
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
             with self._condition:
-                while self._executionCount > 0:
+                # TODO: verify what the correct test should be
+                # while self._executionCount > 0:
+                while self._executionCount > 1:
                     self._condition.wait()
                 self._settingUp = True
 
