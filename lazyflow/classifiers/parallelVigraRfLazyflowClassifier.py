@@ -365,15 +365,15 @@ class ParallelVigraRfLazyflowClassifier(LazyflowVectorwiseClassifierABC):
             # Older projects didn't store the labels explicitly.
             known_labels = range(1, forests[0].labelCount()+1 )
 
-        try:
+        if 'feature_names' in h5py_group.keys():
             feature_names = list(h5py_group['feature_names'][:])
-        except KeyError:
+        else:
             # Older projects don't store feature names.
             feature_names = None
 
-        try:
+        if 'oobs' in h5py_group.keys():
             oobs = list(h5py_group['oobs'][:])
-        except KeyError:
+        else:
             # Older projects didn't store the oobs.
             # Just provide something obviously invalid.
             oobs = [-1.0] * len(forests)
