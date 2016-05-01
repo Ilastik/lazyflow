@@ -30,8 +30,13 @@ from lazyflow.roi import roiFromShape
 from lazyflow.operators.generic import OpSubRegion, OpPixelOperator
 from lazyflow.operators.valueProviders import OpMetadataInjector
 from lazyflow.operators.opReorderAxes import OpReorderAxes
+from lazyflow.utility.timer import timeLogged
 
 from .opExportSlot import OpExportSlot
+
+import logging
+logger = logging.getLogger(__name__)
+
 
 class OpFormattedDataExport(Operator):
     """
@@ -228,8 +233,10 @@ class OpFormattedDataExport(Operator):
     def propagateDirty(self, slot, subindex, roi):
         self._dirty = True
 
+    @timeLogged(logger, logging.INFO)
     def run_export(self):
         self._opExportSlot.run_export()
 
+    @timeLogged(logger, logging.INFO)
     def run_export_to_array(self):
         return self._opExportSlot.run_export_to_array()
