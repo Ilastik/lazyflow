@@ -79,6 +79,7 @@ class OpUnblockedHdf5Cache(Operator):
     
     def _clear_blocks(self):
         assert not self._writer_blocks
+        assert self._reader_lock_count == 0
         keys = self._h5group.keys()
         for k in keys:
             del self._h5group[k]
@@ -176,6 +177,9 @@ class OpUnblockedHdf5Cache(Operator):
         maximum_roi = roiFromShape(self.Input.meta.shape)
 
         if slot == self.Input:
+            assert not self._writer_blocks
+            assert self._reader_lock_count == 0
+
             maximum_roi = self._standardize_roi( *maximum_roi )
             dirty_roi = self._standardize_roi( roi.start, roi.stop )
 
@@ -190,6 +194,8 @@ class OpUnblockedHdf5Cache(Operator):
                     block_roi = eval(block_roi_str)
                     if getIntersection(block_roi, dirty_roi, assertIntersect=False):
                         del self._h5group[block_roi_str]
+
+            self._h5group.file.flush()
 
             self.Output.setDirty( roi )
         else:
