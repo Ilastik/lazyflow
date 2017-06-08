@@ -1261,9 +1261,9 @@ class RequestPool(object):
         try:
             # Launch the initial batch
             n_first_batch = min(self._max_active, len(self._unsubmitted_requests))
-            assert n_first_batch > 0
-            for _ in range(n_first_batch):
-                self._activate_next_request()
+            if n_first_batch > 0:
+                for _ in range(n_first_batch):
+                    self._activate_next_request()
             
             while True:
                 # Wait for at least one request to finish
