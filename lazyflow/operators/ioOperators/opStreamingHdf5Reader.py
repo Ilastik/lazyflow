@@ -86,10 +86,17 @@ class OpStreamingHdf5Reader(Operator):
         assert len(axistags) == len( dataset.shape ),\
             "Mismatch between shape {} and axisorder {}".format( dataset.shape, axisorder )
 
-        # Configure our slot meta-info
-        self.OutputImage.meta.dtype = dataset.dtype.type
-        self.OutputImage.meta.shape = dataset.shape
-        self.OutputImage.meta.axistags = axistags
+        if 'c' is not axisorder:
+            self.OutputImage.meta.dtype = dataset.dtype.type
+            self.OutputImage.meta.shape = (dataset.shape[0], dataset.shape[1], 1)
+            axisorder = get_default_axisordering(self.OutputImage.meta.shape)
+            axistags = vigra.defaultAxistags(str(axisorder))
+            self.OutputImage.meta.axistags = axistags
+        else:
+            # Configure our slot meta-info
+            self.OutputImage.meta.dtype = dataset.dtype.type
+            self.OutputImage.meta.shape = dataset.shape
+            self.OutputImage.meta.axistags = axistags
 
         # If the dataset specifies a datarange, add it to the slot metadata
         if 'drange' in self._hdf5File[internalPath].attrs:
@@ -126,7 +133,14 @@ class OpStreamingHdf5Reader(Operator):
         if result.flags.c_contiguous:
             hdf5File[internalPath].read_direct( result[...], key )
         else:
-            result[...] = hdf5File[internalPath][key]
+            if len(hdf5File[internalPath].shape) == 2:
+                roi.start = (roi.start[0], roi.start[1])
+                roi.stop = (roi.stop[0], roi.stop[1])
+                key = roi.toSlice()
+                result = result[:, :, 0]
+                result[...] = hdf5File[internalPath][key]
+            else:
+                result[...] = hdf5File[internalPath][key]
         if logger.getEffectiveLevel() >= logging.DEBUG:
             t = 1000.0*(time.time()-t)
             logger.debug("took %f msec." % t)
