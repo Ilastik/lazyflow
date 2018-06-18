@@ -82,21 +82,20 @@ class OpStreamingHdf5Reader(Operator):
             # No axistags found.
             axisorder = get_default_axisordering(dataset.shape)
             axistags = vigra.defaultAxistags(str(axisorder))
+            axisorder += 'c'
 
         assert len(axistags) == len( dataset.shape ),\
             "Mismatch between shape {} and axisorder {}".format( dataset.shape, axisorder )
 
+        # Configure our slot meta-info
         self.OutputImage.meta.dtype = dataset.dtype.type
         if 'c' not in axisorder:
             self.OutputImage.meta.shape = (*dataset.shape, 1)
-            axisorder = get_default_axisordering(self.OutputImage.meta.shape)
+            axisorder += 'c'
             axistags = vigra.defaultAxistags(axisorder)
-            self.OutputImage.meta.axistags = axistags
         else:
-            # Configure our slot meta-info
             self.OutputImage.meta.shape = dataset.shape
-            self.OutputImage.meta.axistags = axistags
-
+        self.OutputImage.meta.axistags = axistags
         # If the dataset specifies a datarange, add it to the slot metadata
         if 'drange' in self._hdf5File[internalPath].attrs:
             self.OutputImage.meta.drange = tuple( self._hdf5File[internalPath].attrs['drange'] )
