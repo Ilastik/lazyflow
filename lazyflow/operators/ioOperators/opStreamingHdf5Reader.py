@@ -82,7 +82,6 @@ class OpStreamingHdf5Reader(Operator):
             # No axistags found.
             axisorder = get_default_axisordering(dataset.shape)
             axistags = vigra.defaultAxistags(str(axisorder))
-            axisorder += 'c'
 
         assert len(axistags) == len( dataset.shape ),\
             "Mismatch between shape {} and axisorder {}".format( dataset.shape, axisorder )

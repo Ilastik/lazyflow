@@ -49,9 +49,9 @@ class TestOpExportSlot(object):
         shutil.rmtree(cls._tmpdir) 
     
     def testBasic_Hdf5(self):
-        data = numpy.random.random( (100,100) ).astype( numpy.float32 )
-        data = vigra.taggedView( data, vigra.defaultAxistags('xy') )
-        
+        data = numpy.random.random((100, 100, 1)).astype(numpy.float32)
+        data = vigra.taggedView(data, vigra.defaultAxistags('xyc'))
+
         graph = Graph()
         opPiper = OpArrayPiper(graph=graph)
         opPiper.Input.setValue( data )
@@ -61,8 +61,8 @@ class TestOpExportSlot(object):
         opExport.OutputFormat.setValue( 'hdf5' )
         opExport.OutputFilenameFormat.setValue( self._tmpdir + '/test_export_x{x_start}-{x_stop}_y{y_start}-{y_stop}' )
         opExport.OutputInternalPath.setValue('volume/data')
-        opExport.CoordinateOffset.setValue( (10, 20) )
-        
+        opExport.CoordinateOffset.setValue((10, 20, 0))
+
         assert opExport.ExportPath.ready()
         export_file = PathComponents( opExport.ExportPath.value ).externalPath
         assert os.path.split(export_file)[1] == 'test_export_x10-110_y20-120.h5'
@@ -79,8 +79,8 @@ class TestOpExportSlot(object):
             opRead.cleanUp()
 
     def testBasic_Npy(self):
-        data = numpy.random.random( (100,100) ).astype( numpy.float32 )
-        data = vigra.taggedView( data, vigra.defaultAxistags('xy') )
+        data = numpy.random.random((100, 100, 1)).astype(numpy.float32)
+        data = vigra.taggedView(data, vigra.defaultAxistags('xyc') )
         
         graph = Graph()
         opPiper = OpArrayPiper(graph=graph)
@@ -90,7 +90,7 @@ class TestOpExportSlot(object):
         opExport.Input.connect( opPiper.Output )
         opExport.OutputFormat.setValue( 'numpy' )
         opExport.OutputFilenameFormat.setValue( self._tmpdir + '/test_export_x{x_start}-{x_stop}_y{y_start}-{y_stop}' )
-        opExport.CoordinateOffset.setValue( (10, 20) )
+        opExport.CoordinateOffset.setValue( (10, 20, 0) )
         
         assert opExport.ExportPath.ready()
         assert os.path.split(opExport.ExportPath.value)[1] == 'test_export_x10-110_y20-120.npy'

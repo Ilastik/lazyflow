@@ -45,13 +45,13 @@ class TestOpFormattedDataExport(object):
         graph = Graph()
         opExport = OpFormattedDataExport(graph=graph)
         
-        data = numpy.random.random( (100,100) ).astype( numpy.float32 ) * 100
-        data = vigra.taggedView( data, vigra.defaultAxistags('xy') )
+        data = numpy.random.random((100,100, 1)).astype(numpy.float32) * 100
+        data = vigra.taggedView(data, vigra.defaultAxistags('xyc'))
         opExport.Input.setValue(data)
 
-        sub_roi = [(10, 0), (None, 80)]
-        opExport.RegionStart.setValue( sub_roi[0] )
-        opExport.RegionStop.setValue( sub_roi[1] )
+        sub_roi = [(10, 0, 0), (None, 80, None)]
+        opExport.RegionStart.setValue(sub_roi[0])
+        opExport.RegionStop.setValue(sub_roi[1])
         
         opExport.ExportDtype.setValue( numpy.uint8 )
 
@@ -68,7 +68,7 @@ class TestOpFormattedDataExport(object):
 
         assert opExport.ImageToExport.ready()
         assert opExport.ExportPath.ready()
-        assert opExport.ImageToExport.meta.drange == (100,200)
+        assert opExport.ImageToExport.meta.drange == (100, 200)
         
         #print "exporting data to: {}".format( opExport.ExportPath.value )
         assert opExport.ExportPath.value == self._tmpdir + '/' + 'export_x10-100_y0-80.h5/volume/data'
@@ -79,7 +79,7 @@ class TestOpFormattedDataExport(object):
             opRead.FilePath.setValue( opExport.ExportPath.value )
     
             # Compare with the correct subregion and convert dtype.
-            sub_roi[1] = (100, 80) # Replace 'None' with full extent
+            sub_roi[1] = (100, 80, 1)  # Replace 'None' with full extent
             expected_data = data.view(numpy.ndarray)[roiToSlice(*sub_roi)]
             expected_data = expected_data.astype(numpy.uint8)
             expected_data += 100 # see renormalization settings
