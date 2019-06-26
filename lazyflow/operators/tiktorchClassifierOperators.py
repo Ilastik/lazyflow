@@ -196,19 +196,38 @@ class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocke
                        (self.coord_roi.start, self.coord_roi.stop),
                         assertIntersect=False)
 
+
             try:
                 image_slot = self.Images[subindex]
                 label_slot = self.Labels[subindex]
+                block_shape = label_slot._real_operator.parent.parent.opBlockShape.BlockShapeTrain[0].value
+
                 if intersec == None:
-                    image_blocks, label_blocks, block_ids = self._collect_blocks(image_slot, label_slot, new_coord_roi)
+                    block_starts = getIntersectingBlocks(block_shape, (roi.start, roi.stop))
                 else:
-                    image_blocks, label_blocks, block_ids = self._collect_blocks(image_slot, label_slot, intersec)
-                channel_names = self.Images[0].meta.channel_names
+                    block_starts = getIntersectingBlocks(block_shape, (intersec.start, intersec.stop))
+
+                label_shape = label_slot.meta.shape
+                axis_keys = label_slot.meta.getAxisKeys()
+
+                block_slicings = [
+                    [
+                        slice(None)
+                        if axis == "c"
+                        else slice(dmax - dblock, dmax)
+                        if dstart + dblock > dmax
+                        else slice(dstart, dstart + dblock)
+                        for dstart, dblock, dmax, axis in zip(block_start, block_shape, label_shape, axis_keys)
+                    ]
+                    for block_start in block_starts
+                ]
+
+                image_blocks, label_blocks, block_ids = self._collect_blocks(image_slot, label_slot, block_slicings)
                 axistags = self.Images[0].meta.axistags
+                classifier_factory.update(image_blocks, label_blocks, axistags, block_ids, validation=True)
+
             except Exception as e:
                 logger.debug(e, exc_info=True)
-
-            classifier_factory.update(image_blocks, label_blocks, axistags, block_ids, validation=True)
 
             self.coord_roi = new_coord_roi
 
