@@ -186,7 +186,6 @@ class TikTorchLazyflowClassifierFactory(LazyflowOnlineClassifier):
         assert self.tikTorchClient is not None, "TikTorchLazyflowClassifierFactory not properly initialized."
 
         if self.train_model:
-            self.update(feature_images, label_images, axistags, image_ids)
             self.resume_training()
 
         logger.info(self.description)
@@ -277,7 +276,17 @@ class TikTorchLazyflowClassifierFactory(LazyflowOnlineClassifier):
 
         # reordered_feature_image = self._opReorderAxesInImg.Output([]).wait()
 
-        result = self.tikTorchClient.forward(NDArray(reordered_feature_image)).result().as_numpy()
+        try:
+            fut = self.tikTorchClient.forward(NDArray(reordered_feature_image))
+            result = fut.result(timeout=55).as_numpy()
+        except Exception as e:
+            warnings.warn(f"Predicting {roi} timed out")
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+            return 0
+
         logger.debug(f"Obtained a predicted block of shape {result.shape}")
         if c_was_not_in_output_axis_order:
             result = result[None, ...]
