@@ -92,7 +92,7 @@ class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocke
     def __init__(self, *args, **kwargs):
         super(OpTikTorchTrainPixelwiseClassifierBlocked, self).__init__(*args, **kwargs)
 
-        self.coord_roi = slice((0,),(0,))
+        self.coord_roi = slice((0,), (0,))
 
     def _collect_blocks(self, image_slot, label_slot, nonzero_block_slot):
         classifier_factory = self.ClassifierFactory.value
@@ -138,9 +138,9 @@ class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocke
         return image_data_blocks, label_data_blocks, block_ids
 
     def get_coordroi(self, coord_dict):
-        z = coord_dict['z_coord']
-        y = coord_dict['y_coord']
-        x = coord_dict['x_coord']
+        z = coord_dict["z"]
+        y = coord_dict["y"]
+        x = coord_dict["x"]
 
         return slice((z[0], y[0], x[0], 0), (z[1], y[1], x[1], 1))
 
@@ -192,17 +192,18 @@ class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocke
 
         elif slot == self.ValidationCoord:
             new_coord_roi = self.get_coordroi(self.ValidationCoord[subindex].value)
-            intersec = getIntersection((new_coord_roi.start, new_coord_roi.stop),
-                       (self.coord_roi.start, self.coord_roi.stop),
-                        assertIntersect=False)
-
+            intersec = getIntersection(
+                (new_coord_roi.start, new_coord_roi.stop),
+                (self.coord_roi.start, self.coord_roi.stop),
+                assertIntersect=False,
+            )
 
             try:
                 image_slot = self.Images[subindex]
                 label_slot = self.Labels[subindex]
                 block_shape = label_slot._real_operator.parent.parent.opBlockShape.BlockShapeTrain[0].value
 
-                if intersec == None:
+                if intersec is None:
                     block_starts = getIntersectingBlocks(block_shape, (roi.start, roi.stop))
                 else:
                     block_starts = getIntersectingBlocks(block_shape, (intersec.start, intersec.stop))
