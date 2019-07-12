@@ -92,7 +92,7 @@ class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocke
     def __init__(self, *args, **kwargs):
         super(OpTikTorchTrainPixelwiseClassifierBlocked, self).__init__(*args, **kwargs)
 
-        self.coord_roi = slice((0,), (0,))
+        self.coord_roi = (slice(0,), slice(0,), slice(0,), slice(0,))
 
     def _collect_blocks(self, image_slot, label_slot, nonzero_block_slot):
         classifier_factory = self.ClassifierFactory.value
@@ -142,7 +142,7 @@ class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocke
         y = coord_dict["y"]
         x = coord_dict["x"]
 
-        return slice((z[0], y[0], x[0], 0), (z[1], y[1], x[1], 1))
+        return (slice(z[0], z[1]), slice(y[0], y[1]), slice(x[0], x[1]), slice(0, 1))
 
     def execute(self, slot, subindex, roi, result):
         classifier_factory = self.ClassifierFactory.value
@@ -193,8 +193,8 @@ class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocke
         elif slot == self.ValidationCoord:
             new_coord_roi = self.get_coordroi(self.ValidationCoord[subindex].value)
             intersec = getIntersection(
-                (new_coord_roi.start, new_coord_roi.stop),
-                (self.coord_roi.start, self.coord_roi.stop),
+                ([c.start for c in new_coord_roi], [c.stop for c in new_coord_roi]),
+                ([c.start for c in self.coord_roi], [c.stop for c in self.coord_roi]),
                 assertIntersect=False,
             )
 
