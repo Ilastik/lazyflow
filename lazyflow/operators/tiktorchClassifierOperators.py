@@ -64,6 +64,9 @@ logger = logging.getLogger(__name__)
 
 
 class OpTikTorchTrainClassifierBlocked(OpTrainClassifierBlocked):
+
+    ValidationCoord = InputSlot(level=1)
+
     def __init__(self, *args, **kwargs):
         super(OpTikTorchTrainClassifierBlocked, self).__init__(*args, **kwargs)
 
@@ -79,13 +82,19 @@ class OpTikTorchTrainClassifierBlocked(OpTrainClassifierBlocked):
         self._opPixelwiseTrain.nonzeroLabelBlocks.connect(self.nonzeroLabelBlocks)
         self._opPixelwiseTrain.MaxLabel.connect(self.MaxLabel)
         self._opPixelwiseTrain.progressSignal.subscribe(self.progressSignal)
+        self._opPixelwiseTrain.ValidationCoord.connect(self.ValidationCoord)
 
 
 class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocked):
+
+    ValidationCoord = InputSlot(level=1)
+
     def __init__(self, *args, **kwargs):
         super(OpTikTorchTrainPixelwiseClassifierBlocked, self).__init__(*args, **kwargs)
 
-    def _collect_blocks(self, image_slot, label_slot, block_slicings):
+        self.coord_roi = (slice(0, 0), slice(0, 0), slice(0, 0), slice(0, 0))
+
+    def _collect_blocks(self, image_slot, label_slot, nonzero_block_slot):
         classifier_factory = self.ClassifierFactory.value
         image_data_blocks = []
         label_data_blocks = []
@@ -127,6 +136,13 @@ class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocke
             block_ids.append(tuple(int(block_label_bb_roi[0][i]) for i, key in enumerate(axiskeys) if key != "c"))
 
         return image_data_blocks, label_data_blocks, block_ids
+
+    def get_coordroi(self, coord_dict):
+        z = coord_dict["z"]
+        y = coord_dict["y"]
+        x = coord_dict["x"]
+
+        return (slice(z[0], z[1]), slice(y[0], y[1]), slice(x[0], x[1]), slice(0, 1))
 
     def execute(self, slot, subindex, roi, result):
         classifier_factory = self.ClassifierFactory.value
@@ -170,9 +186,52 @@ class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocke
 
                 image_blocks, label_blocks, block_ids = self._collect_blocks(image_slot, label_slot, block_slicings)
                 axistags = self.Images[0].meta.axistags
-                classifier_factory.update(image_blocks, label_blocks, axistags, block_ids)
+                classifier_factory.update(image_blocks, label_blocks, axistags, block_ids, validation=False)
             except Exception as e:
                 logger.debug(e, exc_info=True)
+
+        elif slot == self.ValidationCoord:
+            new_coord_roi = self.get_coordroi(self.ValidationCoord[subindex].value)
+            intersec = getIntersection(
+                ([c.start for c in new_coord_roi], [c.stop for c in new_coord_roi]),
+                ([c.start for c in self.coord_roi], [c.stop for c in self.coord_roi]),
+                assertIntersect=False,
+            )
+
+            try:
+                image_slot = self.Images[subindex]
+                label_slot = self.Labels[subindex]
+                block_shape = label_slot._real_operator.parent.parent.opBlockShape.BlockShapeTrain[0].value
+
+                if intersec is None:
+                    block_starts = getIntersectingBlocks(block_shape, (roi.start, roi.stop))
+                else:
+                    block_starts = getIntersectingBlocks(block_shape, (intersec.start, intersec.stop))
+
+                label_shape = label_slot.meta.shape
+                axis_keys = label_slot.meta.getAxisKeys()
+
+                block_slicings = [
+                    [
+                        slice(None)
+                        if axis == "c"
+                        else slice(dmax - dblock, dmax)
+                        if dstart + dblock > dmax
+                        else slice(dstart, dstart + dblock)
+                        for dstart, dblock, dmax, axis in zip(block_start, block_shape, label_shape, axis_keys)
+                    ]
+                    for block_start in block_starts
+                ]
+
+                image_blocks, label_blocks, block_ids = self._collect_blocks(image_slot, label_slot, block_slicings)
+                axistags = self.Images[0].meta.axistags
+                classifier_factory.update(image_blocks, label_blocks, axistags, block_ids, validation=True)
+
+            except Exception as e:
+                logger.debug(e, exc_info=True)
+
+            self.coord_roi = new_coord_roi
+
         else:
             super().propagateDirty(slot, subindex, roi)
 
