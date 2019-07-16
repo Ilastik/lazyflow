@@ -92,7 +92,7 @@ class OpTikTorchTrainPixelwiseClassifierBlocked(OpTrainPixelwiseClassifierBlocke
     def __init__(self, *args, **kwargs):
         super(OpTikTorchTrainPixelwiseClassifierBlocked, self).__init__(*args, **kwargs)
 
-        self.coord_roi = (slice(0,), slice(0,), slice(0,), slice(0,))
+        self.coord_roi = (slice(0, 0), slice(0, 0), slice(0, 0), slice(0, 0))
 
     def _collect_blocks(self, image_slot, label_slot, nonzero_block_slot):
         classifier_factory = self.ClassifierFactory.value
