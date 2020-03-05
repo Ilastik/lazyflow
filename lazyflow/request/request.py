@@ -330,6 +330,9 @@ class Request(object):
         Assign this request to the given worker thread.  (A request cannot switch between threads.)
         Must be called from the worker thread.
         """
+        if self._assigned_worker == worker:
+            return
+
         assert self._assigned_worker is None
         self._assigned_worker = worker
 
@@ -472,7 +475,7 @@ class Request(object):
         """
         Resume this request's execution (put it back on the worker's job queue).
         """
-        Request.global_thread_pool.wake_up(self)
+        Request.global_thread_pool.enqueue(self, self._priority)
 
     def _switch_to(self):
         """
@@ -676,6 +679,7 @@ class Request(object):
             current_request._suspend()
         elif direct_execute_needed:
             # Optimization: Don't start a new greenlet.  Directly run this request in the current greenlet.
+            self._priority = current_request._priority
             self.greenlet = current_request.greenlet
             self.greenlet.owning_requests.append(self)
             self._assigned_worker = current_request._assigned_worker
