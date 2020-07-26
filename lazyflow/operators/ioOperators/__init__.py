@@ -60,6 +60,3 @@ from .opExportMultipageTiffSequence import OpExportMultipageTiffSequence
 from .opExportToArray import OpExportToArray
 from .opExportSlot import OpExportSlot
 from .opFormattedDataExport import OpFormattedDataExport
-
-from .hdf5SerializerKnime import *
-from .opExportToKnime import OpExportToKnime
