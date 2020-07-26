@@ -1026,7 +1026,7 @@ class Slot(object):
             if temp.shape == (1,):
                 return temp[0]
             return temp
-        elif isinstance(temp, list):
+        elif isinstance(temp, list) and self.stype != Opaque:
             return temp[0]
         else:
             warnings.warn(
